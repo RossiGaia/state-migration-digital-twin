@@ -1,0 +1,10 @@
+connections:
+  mqtt:
+    broker_url: "localhost"
+    port: 1883
+    topics:
+    - "test/#"
+    - "control"
+
+  buffer:
+    size: 100
