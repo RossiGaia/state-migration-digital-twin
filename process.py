@@ -174,9 +174,7 @@ class BaseProcessing:
         if not buf:
             return {"mean": None, "slope_per_s": None}
 
-        # Optional: use a shorter window if provided in config; else full buffer
-        window = buffer_conf.get("stats_window", len(buf))
-        window = max(2, min(window, len(buf)))
+        window = len(buf)
 
         xs = list(buf)[-window:]
         ys = [row.get(key) for row in xs if row.get(key) is not None]
@@ -201,25 +199,25 @@ class BaseProcessing:
         Heuristic 0..100 (higher is healthier).
         Penalize high vibration, high friction, high motor temp above ambient, high wear, excessive tension.
         """
-        vib  = self._safe_float(row.get("motor_vibration"), 0.0)   # mm/s
-        mu   = self._safe_float(row.get("belt_friction"), 0.02)    # -
-        tmo  = self._safe_float(row.get("motor_temperature"), 0.0) # °C
-        amb  = self._safe_float(row.get("ambient_temperature"), 20.0)
-        wear = self._safe_float(row.get("wear"), 0.0)              # 0..100
-        tens = self._safe_float(row.get("belt_tension"), 200.0)    # N
+        vib = self._safe_float(row.get("motor_vibration"), 0.0)  # mm/s
+        mu = self._safe_float(row.get("belt_friction"), 0.02)  # -
+        tmo = self._safe_float(row.get("motor_temperature"), 0.0)  # °C
+        amb = self._safe_float(row.get("ambient_temperature"), 20.0)
+        wear = self._safe_float(row.get("wear"), 0.0)  # 0..100
+        tens = self._safe_float(row.get("belt_tension"), 200.0)  # N
 
-        vib_risk  = min(vib / 4.5, 1.0)                      # >4.5 mm/s is concerning
-        mu_risk   = min(max((mu - 0.03) / 0.02, 0.0), 1.0)   # 0.03..0.05 window
-        temp_risk = min(max((tmo - amb - 25.0) / 35.0, 0.0), 1.0) # > amb+25 °C
+        vib_risk = min(vib / 4.5, 1.0)  # >4.5 mm/s is concerning
+        mu_risk = min(max((mu - 0.03) / 0.02, 0.0), 1.0)  # 0.03..0.05 window
+        temp_risk = min(max((tmo - amb - 25.0) / 35.0, 0.0), 1.0)  # > amb+25 °C
         wear_risk = min(wear / 100.0, 1.0)
-        tens_risk = min(max((tens - 260.0) / 100.0, 0.0), 1.0)    # >260 N
+        tens_risk = min(max((tens - 260.0) / 100.0, 0.0), 1.0)  # >260 N
 
         risk = (
-            0.30 * vib_risk +
-            0.20 * mu_risk +
-            0.25 * temp_risk +
-            0.15 * wear_risk +
-            0.10 * tens_risk
+            0.30 * vib_risk
+            + 0.20 * mu_risk
+            + 0.25 * temp_risk
+            + 0.15 * wear_risk
+            + 0.10 * tens_risk
         )
         health = max(0.0, 100.0 * (1.0 - risk))
         return round(health, 1)
