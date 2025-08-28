@@ -2,7 +2,6 @@
 import paho.mqtt.client as mqtt
 import yaml
 import logging
-import collections
 import time
 
 logging.basicConfig(level=logging.DEBUG)
@@ -23,11 +22,11 @@ buffer_conf = connections_conf["buffer"]
 
 class MqttConnection:
 
-    def __init__(self):
+    def __init__(self, recv_buffer):
         self.mqtt_loop_run = True
         self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
 
-        self.recv_buffer = collections.deque(maxlen=buffer_conf["size"])
+        self.recv_buffer = recv_buffer
 
         self.mqtt_client.on_connect = self.on_connect
         self.mqtt_client.on_message = self.on_message
@@ -44,7 +43,7 @@ class MqttConnection:
             "payload": str(msg.payload),
             "recv_timestamp": time.time(),
         }
-        self.recv_buffer.append(data)
+        self.recv_buffer.appendLeft(data)
 
     def run(self):
         logger.debug(f"connecting to {mqtt_broker_url} at {mqtt_port}")

@@ -8,3 +8,7 @@ connections:
 
   buffer:
     size: 100
+
+process:
+  buffer:
+    size: 100
