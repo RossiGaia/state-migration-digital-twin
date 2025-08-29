@@ -1,8 +1,12 @@
 from dataclasses import dataclass, asdict
 import collections
 import yaml
-import json
 import time
+import logging
+import json
+
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
 
 # maybe set it as env var
 conf_path = "config.yaml"
@@ -46,19 +50,19 @@ class BaseProcessing:
         Drain recv_buffer, update virtual twin, compute KPIs, and append snapshots.
         Each processing_buffer item is a compact dict with raw + derived fields.
         """
-        backoff_idle_s = 0.01  # tiny sleep to avoid busy-wait when no data
         while self.running:
-            got_any = False
 
-            # Drain all currently available messages so we keep up under bursty input
-            while self.running and len(self.recv_buffer) > 0:
-                got_any = True
+            if len(self.recv_buffer) > 0:
                 raw_msg = None
                 try:
-                    raw_msg = self.recv_buffer.pop()  # newest message wins
-                    payload = json.loads(raw_msg)
-                except Exception:
+                    raw_msg = self.recv_buffer.popleft()
+                    payload = raw_msg["payload"]
+                    logger.debug(
+                        f"popped from recv_buffer {raw_msg["payload"]["status"]}."
+                    )
+                except Exception as e:
                     # Malformed JSON or non-string; skip safely
+                    logger.debug(e)
                     continue
 
                 status = payload.get("status", {}) if isinstance(payload, dict) else {}
@@ -144,11 +148,16 @@ class BaseProcessing:
                     ),
                 }
 
+                snap["processed_timestamp"] = time.time()
+                snap["recv_timestamp"] = raw_msg["recv_timestamp"]
                 # Replace the last appended item with enriched snapshot (keep deque length)
                 self.processing_buffer[-1] = snap
-
-            if not got_any:
-                time.sleep(backoff_idle_s)
+                logger.info(
+                    f"Buffers size in MB:\n\trecv_buffer: {len(json.dumps(list(self.recv_buffer)).encode("utf-8")) / 1024 / 1024}\n\tprocessing_buffer: {len(json.dumps(list(self.processing_buffer)).encode("utf-8")) / 1024 / 1024}"
+                )
+                logger.debug(json.dumps(snap, indent=4))
+                logger.debug(f"time to elaborate the message: {snap["processed_timestamp"] - snap["recv_timestamp"]}")
+            time.sleep(0.5)
 
     def stop(self):
         self.running = False

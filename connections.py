@@ -3,6 +3,7 @@ import paho.mqtt.client as mqtt
 import yaml
 import logging
 import time
+import json
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
@@ -40,13 +41,13 @@ class MqttConnection:
     def on_message(self, client, userdata, msg):
         data = {
             "topic": msg.topic,
-            "payload": str(msg.payload),
+            "payload": json.loads(msg.payload),
             "recv_timestamp": time.time(),
         }
-        self.recv_buffer.appendLeft(data)
+        self.recv_buffer.append(data)
 
     def run(self):
-        logger.debug(f"connecting to {mqtt_broker_url} at {mqtt_port}")
+        logger.debug(f"connecting to {mqtt_broker_url} at {mqtt_port}.")
         self.mqtt_client.connect(mqtt_broker_url, mqtt_port)
         self.mqtt_client.loop_start()
 
