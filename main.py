@@ -1,5 +1,6 @@
 from connections import MqttConnection
 from process import BaseProcessing
+from migrate_replication import MigratePatternReplication
 import threading
 import collections
 import signal
@@ -23,6 +24,9 @@ recv_buffer = collections.deque(maxlen=100)
 
 mqtt_connection = MqttConnection(recv_buffer)
 processing = BaseProcessing(recv_buffer)
+
+migrate_pattern = MigratePatternReplication(processing)
+
 
 mqtt_t = threading.Thread(target=mqtt_connection.run)
 mqtt_t.start()
