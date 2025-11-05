@@ -1,24 +1,10 @@
 from dataclasses import dataclass, asdict
-import collections
-import yaml
 import time
 import logging
 import json
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
-
-# maybe set it as env var
-conf_path = "config.yaml"
-
-# create the virtualized version of the conveyor belt (copy the vars)
-# expose the values directly
-# expose the calculations
-
-conf_raw = open(conf_path)
-process_conf = yaml.safe_load(conf_raw)["process"]
-
-buffer_conf = process_conf["buffer"]
 
 
 @dataclass
@@ -38,60 +24,66 @@ class VirtualizedConveyorPlant:
     wear: float = 5.0
 
 
-class BaseProcessing:
-    def __init__(self, recv_buffer):
-        self.recv_buffer = recv_buffer
-        self.processing_buffer = collections.deque(maxlen=buffer_conf["size"])
+class Processing:
+    def __init__(self, *, connection_buffer, processing_buffer, state_max_size=None):
+        self.connection_buffer = connection_buffer
+        self.processing_buffer = processing_buffer
         self.running = True
         self.conveyor_params = VirtualizedConveyorPlant()
+        self.state_max_size = state_max_size
 
     def run(self):
         """
-        Drain recv_buffer, update virtual twin, compute KPIs, and append snapshots.
+        Drain connection_buffer, update virtual twin, compute KPIs, and append snapshots.
         Each processing_buffer item is a compact dict with raw + derived fields.
         """
         while self.running:
 
-            if len(self.recv_buffer) > 0:
+            if len(self.connection_buffer) > 0:
                 raw_msg = None
                 try:
-                    raw_msg = self.recv_buffer.popleft()
+                    raw_msg = self.connection_buffer.popleft()
                     payload = raw_msg["payload"]
-                    logger.debug(
-                        f"popped from recv_buffer {raw_msg["payload"]["status"]}."
-                    )
+                    # logger.debug(
+                    #     f"popped from connection_buffer {raw_msg["payload"]["status"]}."
+                    # )
                 except Exception as e:
-                    # Malformed JSON or non-string; skip safely
                     logger.debug(e)
                     continue
 
-                status = payload.get("status", {}) if isinstance(payload, dict) else {}
-                # Update the virtualized twin (type-safe coercion)
-                vp = self.conveyor_params
-                vp.name = status.get("name", vp.name)
-                vp.load = status.get("load", vp.load)
-                vp.angular_acceleration = status.get(
-                    "angular_acceleration", vp.angular_acceleration
+                status = payload.get("status", {})
+                pt_metrics = self.conveyor_params
+                pt_metrics.name = status.get("name", pt_metrics.name)
+                pt_metrics.load = status.get("load", pt_metrics.load)
+                pt_metrics.angular_acceleration = status.get(
+                    "angular_acceleration", pt_metrics.angular_acceleration
                 )
-                vp.angular_speed = status.get("angular_speed", vp.angular_speed)
-                vp.motor_vibration = status.get("motor_vibration", vp.motor_vibration)
-                vp.belt_tension = status.get("belt_tension", vp.belt_tension)
-                vp.ambient_temperature = status.get(
-                    "ambient_temperature", vp.ambient_temperature
+                pt_metrics.angular_speed = status.get(
+                    "angular_speed", pt_metrics.angular_speed
                 )
-                vp.motor_temperature = status.get(
-                    "motor_temperature", vp.motor_temperature
+                pt_metrics.motor_vibration = status.get(
+                    "motor_vibration", pt_metrics.motor_vibration
                 )
-                vp.belt_friction = status.get("belt_friction", vp.belt_friction)
-                vp.wear = status.get("wear", vp.wear)
+                pt_metrics.belt_tension = status.get(
+                    "belt_tension", pt_metrics.belt_tension
+                )
+                pt_metrics.ambient_temperature = status.get(
+                    "ambient_temperature", pt_metrics.ambient_temperature
+                )
+                pt_metrics.motor_temperature = status.get(
+                    "motor_temperature", pt_metrics.motor_temperature
+                )
+                pt_metrics.belt_friction = status.get(
+                    "belt_friction", pt_metrics.belt_friction
+                )
+                pt_metrics.wear = status.get("wear", pt_metrics.wear)
 
-                # Build snapshot (raw)
                 snap = self._snapshot()
 
                 # Derived metrics (per-sample)
                 # Instantaneous mechanical power proxy: P ≈ T * ω (units: N·m * rad/s = W),
                 # but we don't have shaft torque; approximate with belt_tension and a nominal pulley radius.
-                # If you know the radius, put it in config; we use 0.15 m nominal here.
+                # If you know the radius, put it in config; use 0.15 m nominal.
                 R_PULLEY = 0.15
                 approx_torque = snap["belt_tension"] * R_PULLEY  # N·m
                 approx_power_w = approx_torque * snap["angular_speed"]  # W
@@ -102,10 +94,6 @@ class BaseProcessing:
                     snap["motor_temperature"] - snap["ambient_temperature"], 3
                 )
 
-                # Append raw + instant derived first, so rolling stats include this point
-                self.processing_buffer.append(snap)
-
-                # Rolling stats (last N points; N from config size or a subset)
                 for key in (
                     "angular_speed",
                     "motor_vibration",
@@ -123,7 +111,6 @@ class BaseProcessing:
                         else round(stats["slope_per_s"], 6)
                     )
 
-                # Health score & simple anomaly flags
                 health = self._health_score(snap)
                 snap["health"] = health
                 snap["anomaly"] = {
@@ -150,14 +137,33 @@ class BaseProcessing:
 
                 snap["processed_timestamp"] = time.time()
                 snap["recv_timestamp"] = raw_msg["recv_timestamp"]
-                # Replace the last appended item with enriched snapshot (keep deque length)
-                self.processing_buffer[-1] = snap
+
+                snap_size = len(json.dumps(snap))
+
+                if self.state_max_size:
+                    snap["padding"] = self.generate_padding(
+                        self.state_max_size, snap_size
+                    )
+
+                self.processing_buffer.append(snap)
                 logger.info(
-                    f"Buffers size in MB:\n\trecv_buffer: {len(json.dumps(list(self.recv_buffer)).encode("utf-8")) / 1024 / 1024}\n\tprocessing_buffer: {len(json.dumps(list(self.processing_buffer)).encode("utf-8")) / 1024 / 1024}"
+                    f"Buffers size in MB:\n\tconnection_buffer: {len(json.dumps(list(self.connection_buffer)).encode("utf-8")) / 1024 / 1024}\n\tprocessing_buffer: {len(json.dumps(list(self.processing_buffer)).encode("utf-8")) / 1024 / 1024} with {len(self.processing_buffer)} number of elements"
                 )
-                logger.debug(json.dumps(snap, indent=4))
-                logger.debug(f"time to elaborate the message: {snap["processed_timestamp"] - snap["recv_timestamp"]}")
-            time.sleep(0.5)
+                # logger.debug(json.dumps(snap, indent=4))
+                logger.debug(
+                    f"time to elaborate the message: {snap["processed_timestamp"] - snap["recv_timestamp"]}"
+                )
+
+    def generate_padding(self, max_size, current_size):
+        buffer_max_length = self.processing_buffer.maxlen
+        padding_length = (
+            round(max_size * 1024 * 1024 / buffer_max_length) - current_size
+        )
+        logger.debug(f"Padding size: {padding_length}")
+        if padding_length > 0:
+            return "0" * padding_length
+        else:
+            return None
 
     def stop(self):
         self.running = False
@@ -200,7 +206,7 @@ class BaseProcessing:
         ybar = mean
         num = sum((xt[i] - xbar) * (ys[i] - ybar) for i in range(len(ys)))
         den = sum((xt[i] - xbar) ** 2 for i in range(len(ys))) or 1.0
-        slope = num / den  # units per second
+        slope = num / den
         return {"mean": mean, "slope_per_s": slope}
 
     def _health_score(self, row):
