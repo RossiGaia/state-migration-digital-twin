@@ -3,7 +3,7 @@ from process import Processing
 import threading
 import collections
 import signal
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 import yaml
 import logging
 
@@ -61,6 +61,21 @@ mqtt_t.start()
 processing_t = threading.Thread(target=processing.run)
 processing_t.start()
 
+
+@app.route("/state", methods=["GET"])
+def get_state():
+    state = processing.serialize_state()
+    return jsonify({"state": state})
+
+
+@app.route("/state", methods=["POST"])
+def set_state():
+    serialized_state = request.get_json()["state"]
+    result = processing.deserialize_state(serialized_state)
+    if result == 0:
+        return jsonify({"status": "success"})
+    else:
+        return jsonify({"status": "error"})
 
 @app.route("/healthd")
 def health_check():

@@ -189,9 +189,7 @@ class Processing:
 
         return percentile
 
-    def compute_reliability(
-        self, window_length_sec: int, expected_msg_sec: int
-    ):
+    def compute_reliability(self, window_length_sec: int, expected_msg_sec: int):
         end_window_time = time.time()
         start_window_time = time.time() - window_length_sec
 
@@ -297,3 +295,25 @@ class Processing:
         )
         health = max(0.0, 100.0 * (1.0 - risk))
         return round(health, 1)
+
+    def serialize_state(self):
+        state = {
+            "connection_buffer": list(self.connection_buffer),
+            "processing_buffer": list(self.processing_buffer),
+            "conveyor_params": self.conveyor_params,
+            "state_max_size": self.state_max_size,
+        }
+        return state
+
+    def deserialize_state(self, serialized_state):
+        try:
+            self.connection_buffer = list([]) if len(serialized_state["connection_buffer"]) == 0 else serialized_state["connection_buffer"]
+            self.processing_buffer = serialized_state["processing_buffer"]
+            self.conveyor_params = serialized_state["conveyor_params"]
+            self.state_max_size = serialized_state["state_max_size"]
+        except Exception as e:
+            logger.error(f"Error in deserialization. {e}")
+            logger.error(f"Connection buffer -> {serialized_state["connection_buffer"]}")
+            return -1
+        
+        return 0

@@ -14,4 +14,4 @@ process:
     size: 100
 
 state:
-  max_size_mb: 10
+  max_size_mb: 5
