@@ -3,8 +3,15 @@ import logging
 import time
 import json
 
-logging.basicConfig(level=logging.DEBUG)
+
+logging.basicConfig(
+    format="%(asctime)s,%(msecs)03d %(name)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.DEBUG,
+    handlers=[logging.FileHandler("dt_connections.log"), logging.StreamHandler()],
+)
 logger = logging.getLogger(__name__)
+
 
 class MqttConnection:
 
@@ -49,4 +56,4 @@ class MqttConnection:
 
     def stop(self):
         self.mqtt_loop_run = False
-        logger.debug(f"stop requested. mqtt_loop_run = {self.mqtt_loop_run}") 
+        logger.debug(f"stop requested. mqtt_loop_run = {self.mqtt_loop_run}")

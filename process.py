@@ -2,8 +2,14 @@ from dataclasses import dataclass, asdict
 import time
 import logging
 import json
+import collections
 
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(
+    format="%(asctime)s,%(msecs)03d %(name)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.DEBUG,
+    handlers=[logging.FileHandler("dt_process.log"), logging.StreamHandler()],
+)
 logger = logging.getLogger(__name__)
 
 
@@ -28,9 +34,12 @@ class Processing:
     def __init__(self, *, connection_buffer, processing_buffer, state_max_size=None):
         self.connection_buffer = connection_buffer
         self.processing_buffer = processing_buffer
+        self.observations = collections.deque(maxlen=100)
+        self.messages = collections.deque(maxlen=100)
         self.running = True
         self.conveyor_params = VirtualizedConveyorPlant()
         self.state_max_size = state_max_size
+        self.odte = None
 
     def run(self):
         """
@@ -164,6 +173,58 @@ class Processing:
             return "0" * padding_length
         else:
             return None
+
+    def compute_timeliness(self, desired_timeliness_sec: float):
+        obs_list = list(self.observations)
+
+        if len(obs_list) == 0:
+            return 0.0
+
+        count = 0
+        for obs in obs_list:
+            if obs <= desired_timeliness_sec:
+                count += 1
+
+        percentile = float(count / len(obs_list))
+
+        return percentile
+
+    def compute_reliability(
+        self, window_length_sec: int, expected_msg_sec: int
+    ):
+        end_window_time = time.time()
+        start_window_time = time.time() - window_length_sec
+
+        msg_list = list(self.messages)
+        msg_required = msg_list[-window_length_sec * expected_msg_sec :]
+
+        count = 0
+        for msg in msg_required:
+            if (
+                msg["timestamp"] >= start_window_time
+                and msg["timestamp"] <= end_window_time
+            ):
+                count += 1
+
+        expected_msg_tot = window_length_sec * expected_msg_sec
+
+        return float(count / expected_msg_tot)
+
+    def compute_availability(self):
+        return 1.0
+
+    def compute_odte_phytodig(
+        self, window_length_sec, desired_timeliness_sec, expected_msg_sec
+    ):
+        timeliness = self.compute_timeliness(desired_timeliness_sec)
+        reliability = self.compute_reliability(window_length_sec, expected_msg_sec)
+        availability = self.compute_availability()
+
+        logger.debug(
+            f"Availability: {availability}\tReliability: {reliability}\tTimeliness: {timeliness}"
+        )
+
+        return timeliness * reliability * availability
 
     def stop(self):
         self.running = False

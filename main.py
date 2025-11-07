@@ -5,6 +5,16 @@ import collections
 import signal
 from flask import Flask, jsonify
 import yaml
+import logging
+
+
+logging.basicConfig(
+    format="%(asctime)s,%(msecs)03d %(name)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    level=logging.DEBUG,
+    handlers=[logging.FileHandler("dt_main.log"), logging.StreamHandler()],
+)
+logger = logging.getLogger(__name__)
 
 conf_path = "config.yaml"
 
@@ -52,10 +62,16 @@ processing_t = threading.Thread(target=processing.run)
 processing_t.start()
 
 
-@app.route("/dt_health")
+@app.route("/healthd")
 def health_check():
-    return jsonify("OK"), 200
+    return jsonify({"status": "healthy"}), 200
+
+@app.route("/odte")
+def odte():
+    odte = processing.compute_odte_phytodig(10, 200, 5)
+    return jsonify({"odte": odte})
 
 
 if __name__ == "__main__":
+    logger.debug("Started main.")
     app.run(host="0.0.0.0", port=5002)
