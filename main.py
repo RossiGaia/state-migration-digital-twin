@@ -6,6 +6,7 @@ import signal
 from flask import Flask, jsonify, request
 import yaml
 import logging
+import time
 
 
 logging.basicConfig(
@@ -28,6 +29,9 @@ connection_mqtt_conf = connection_conf["mqtt"]
 
 state_max_size = confs["state"]["max_size_mb"]
 
+metrics_file_name = f"{confs["name"]}_{confs["metrics"]["file_name"]}"
+with open(metrics_file_name, "a") as metrics_file:
+    metrics_file.write("Log started.\n")
 
 def graceful_shutdown(signum, frame):
     processing.stop()
@@ -35,6 +39,10 @@ def graceful_shutdown(signum, frame):
 
     mqtt_connection.stop()
     mqtt_t.join()
+    with open(metrics_file_name, "a") as metrics_file:
+        metrics_file.write(
+            f"Stopped serving at {time.time()}.\n"
+        )
     exit(0)
 
 
@@ -54,7 +62,6 @@ processing = Processing(
     state_max_size=state_max_size,
 )
 
-
 mqtt_t = threading.Thread(target=mqtt_connection.run)
 mqtt_t.start()
 
@@ -64,29 +71,50 @@ processing_t.start()
 
 @app.route("/state", methods=["GET"])
 def get_state():
+    dump_start_timestamp = time.time()
     state = processing.serialize_state()
+    dump_end_timestamp = time.time()
+    with open(metrics_file_name, "a") as metrics_file:
+        metrics_file.write(
+            f"Dumping total time: {dump_end_timestamp - dump_start_timestamp}. Started at {dump_start_timestamp}, ended at {dump_end_timestamp}.\n"
+        )
     return jsonify({"state": state})
 
 
 @app.route("/state", methods=["POST"])
 def set_state():
+    restore_start_timestamp = time.time()
     serialized_state = request.get_json()["state"]
     result = processing.deserialize_state(serialized_state)
+    restore_end_timestamp = time.time()
+    
+    with open(metrics_file_name, "a") as metrics_file:
+        metrics_file.write(
+            f"Restoring total time: {restore_end_timestamp - restore_start_timestamp}. Started at {restore_start_timestamp}, ended at {restore_end_timestamp}.\n"
+        )
     if result == 0:
         return jsonify({"status": "success"})
     else:
         return jsonify({"status": "error"})
 
+
 @app.route("/healthd")
 def health_check():
     return jsonify({"status": "healthy"}), 200
 
+
 @app.route("/odte")
 def odte():
-    odte = processing.compute_odte_phytodig(10, 200, 5)
+    odte = processing.get_odte()
     return jsonify({"odte": odte})
 
 
 if __name__ == "__main__":
     logger.debug("Started main.")
+
+    with open(metrics_file_name, "a") as metrics_file:
+        metrics_file.write(
+            f"Starting service at {time.time()}.\n"
+        )
+
     app.run(host="0.0.0.0", port=5002)

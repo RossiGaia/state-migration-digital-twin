@@ -1,3 +1,5 @@
+name: "DT1_ABCDEF"
+
 connections:
   mqtt:
     broker_url: "localhost"
@@ -15,3 +17,7 @@ process:
 
 state:
   max_size_mb: 5
+
+
+metrics:
+  file_name: "metrics.log"

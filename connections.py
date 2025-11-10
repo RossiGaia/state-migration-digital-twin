@@ -2,7 +2,8 @@ import paho.mqtt.client as mqtt
 import logging
 import time
 import json
-
+import random
+import string
 
 logging.basicConfig(
     format="%(asctime)s,%(msecs)03d %(name)s %(levelname)s %(message)s",
@@ -38,6 +39,7 @@ class MqttConnection:
             "topic": msg.topic,
             "payload": json.loads(msg.payload),
             "recv_timestamp": time.time(),
+            "key": ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
         }
         self.connection_buffer.append(data)
 

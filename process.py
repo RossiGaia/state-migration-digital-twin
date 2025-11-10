@@ -3,6 +3,7 @@ import time
 import logging
 import json
 import collections
+import threading
 
 logging.basicConfig(
     format="%(asctime)s,%(msecs)03d %(name)s %(levelname)s %(message)s",
@@ -40,17 +41,23 @@ class Processing:
         self.conveyor_params = VirtualizedConveyorPlant()
         self.state_max_size = state_max_size
         self.odte = None
+        self.lock = threading.Lock()
 
     def run(self):
         """
         Drain connection_buffer, update virtual twin, compute KPIs, and append snapshots.
         Each processing_buffer item is a compact dict with raw + derived fields.
         """
+
+        odte_t = threading.Thread(target=self.odte_computation, daemon=True)
+        odte_t.start()
+
         while self.running:
 
             if len(self.connection_buffer) > 0:
                 raw_msg = None
                 try:
+                    message_processing_start = time.time()
                     raw_msg = self.connection_buffer.popleft()
                     payload = raw_msg["payload"]
                     # logger.debug(
@@ -144,8 +151,10 @@ class Processing:
                     ),
                 }
 
-                snap["processed_timestamp"] = time.time()
+                snap["processed_timestamp"] = time.time() - message_processing_start
                 snap["recv_timestamp"] = raw_msg["recv_timestamp"]
+                snap["creation_timestamp"] = raw_msg["payload"]["creation_timestamp"]
+                snap["key"] = raw_msg["key"]
 
                 snap_size = len(json.dumps(snap))
 
@@ -155,12 +164,22 @@ class Processing:
                     )
 
                 self.processing_buffer.append(snap)
+
+                observation_obj = {
+                    "key": snap["key"],
+                    "received_timestamp": snap["recv_timestamp"],
+                    "creation_timestamp": snap["creation_timestamp"],
+                    "execution_timestamp": snap["processed_timestamp"],
+                    "obs_value": snap["recv_timestamp"] - snap["creation_timestamp"] + snap["processed_timestamp"]
+                }
+                self.observations.append(observation_obj)
+
                 logger.info(
                     f"Buffers size in MB:\n\tconnection_buffer: {len(json.dumps(list(self.connection_buffer)).encode("utf-8")) / 1024 / 1024}\n\tprocessing_buffer: {len(json.dumps(list(self.processing_buffer)).encode("utf-8")) / 1024 / 1024} with {len(self.processing_buffer)} number of elements"
                 )
                 # logger.debug(json.dumps(snap, indent=4))
                 logger.debug(
-                    f"time to elaborate the message: {snap["processed_timestamp"] - snap["recv_timestamp"]}"
+                    f"time to elaborate the message: {time.time() - snap["recv_timestamp"]}"
                 )
 
     def generate_padding(self, max_size, current_size):
@@ -181,8 +200,8 @@ class Processing:
             return 0.0
 
         count = 0
-        for obs in obs_list:
-            if obs <= desired_timeliness_sec:
+        for obs_obj in obs_list:
+            if obs_obj["obs_value"] <= desired_timeliness_sec:
                 count += 1
 
         percentile = float(count / len(obs_list))
@@ -193,14 +212,14 @@ class Processing:
         end_window_time = time.time()
         start_window_time = time.time() - window_length_sec
 
-        msg_list = list(self.messages)
+        msg_list = list(self.processing_buffer)
         msg_required = msg_list[-window_length_sec * expected_msg_sec :]
 
         count = 0
         for msg in msg_required:
             if (
-                msg["timestamp"] >= start_window_time
-                and msg["timestamp"] <= end_window_time
+                msg["creation_timestamp"] >= start_window_time
+                and msg["creation_timestamp"] <= end_window_time
             ):
                 count += 1
 
@@ -297,23 +316,43 @@ class Processing:
         return round(health, 1)
 
     def serialize_state(self):
-        state = {
-            "connection_buffer": list(self.connection_buffer),
-            "processing_buffer": list(self.processing_buffer),
-            "conveyor_params": self.conveyor_params,
-            "state_max_size": self.state_max_size,
-        }
-        return state
+        with self.lock:
+            state = {
+                "connection_buffer": list(self.connection_buffer),
+                "processing_buffer": list(self.processing_buffer),
+                "conveyor_params": self.conveyor_params,
+                "state_max_size": self.state_max_size,
+            }
+            return state
 
     def deserialize_state(self, serialized_state):
-        try:
-            self.connection_buffer = list([]) if len(serialized_state["connection_buffer"]) == 0 else serialized_state["connection_buffer"]
-            self.processing_buffer = serialized_state["processing_buffer"]
-            self.conveyor_params = serialized_state["conveyor_params"]
-            self.state_max_size = serialized_state["state_max_size"]
-        except Exception as e:
-            logger.error(f"Error in deserialization. {e}")
-            logger.error(f"Connection buffer -> {serialized_state["connection_buffer"]}")
-            return -1
-        
-        return 0
+        with self.lock:
+            try:
+                self.connection_buffer = (
+                    list([])
+                    if len(serialized_state["connection_buffer"]) == 0
+                    else serialized_state["connection_buffer"]
+                )
+                self.processing_buffer = serialized_state["processing_buffer"]
+                self.conveyor_params = serialized_state["conveyor_params"]
+                self.state_max_size = serialized_state["state_max_size"]
+            except Exception as e:
+                logger.error(f"Error in deserialization. {e}")
+                logger.error(
+                    f"Connection buffer -> {serialized_state["connection_buffer"]}"
+                )
+                return -1
+
+            return 0
+
+    def odte_computation(self):
+        while self.running:
+            new_odte = self.compute_odte_phytodig(10, 200, 5)
+            with self.lock:
+                self.odte = new_odte
+
+            time.sleep(0.5)
+
+    def get_odte(self):
+        with self.lock:
+            return self.odte
