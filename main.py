@@ -133,6 +133,11 @@ def odte():
     return jsonify({"odte": odte})
 
 
+@app.route("/delta")
+def get_delta():
+    delta = processing.get_delta()
+    return jsonify({"delta": delta})
+
 if __name__ == "__main__":
     logger.debug("Started main.")
 

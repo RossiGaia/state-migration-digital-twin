@@ -1,9 +1,10 @@
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 import time
 import logging
 import json
 import collections
 import threading
+import json
 
 logging.basicConfig(
     format="%(asctime)s,%(msecs)03d %(name)s %(levelname)s %(message)s",
@@ -42,6 +43,7 @@ class Processing:
         self.state_max_size = state_max_size
         self.odte = None
         self.lock = threading.Lock()
+        self.transmitted_state = {}
 
     def run(self):
         """
@@ -170,7 +172,9 @@ class Processing:
                     "received_timestamp": snap["recv_timestamp"],
                     "creation_timestamp": snap["creation_timestamp"],
                     "execution_timestamp": snap["processed_timestamp"],
-                    "obs_value": snap["recv_timestamp"] - snap["creation_timestamp"] + snap["processed_timestamp"]
+                    "obs_value": snap["recv_timestamp"]
+                    - snap["creation_timestamp"]
+                    + snap["processed_timestamp"],
                 }
                 self.observations.append(observation_obj)
 
@@ -364,3 +368,49 @@ class Processing:
     def get_odte(self):
         with self.lock:
             return self.odte
+
+    def get_delta(self):
+        current_state = self.serialize_state()
+        conveyor_params_diff = {}
+        current_conveyor_params = current_state["conveyor_params"]
+        transmitted_conveyor_params = (
+            self.transmitted_state["conveyor_params"]
+            if self.transmitted_state != {}
+            else VirtualizedConveyorPlant()
+        )
+
+
+        for f in fields(current_conveyor_params):
+            name = f.name
+            current = getattr(current_conveyor_params, name)
+            transmitted = getattr(transmitted_conveyor_params, name, None)
+            if current != transmitted:
+                conveyor_params_diff[name] = current
+
+        # difference between processing buffer 
+        current_state_processing_set = {json.dumps(element) for element in current_state["processing_buffer"]}
+        if self.transmitted_state == {}:
+            transmitted_processing_set = set()
+        else:
+            transmitted_processing_set = {json.dumps(element) for element in self.transmitted_state["processing_buffer"]}
+        processing_buffer_diff =  [json.loads(x) for x in (current_state_processing_set - transmitted_processing_set)]
+
+        # difference between connection buffer
+        current_state_connection_set = {json.dumps(element) for element in current_state["connection_buffer"]}
+        if self.transmitted_state == {}:
+            transmitted_connection_set = set()
+        else:
+            transmitted_connection_set = {json.dumps(element) for element in self.transmitted_state["connection_buffer"]}
+        connection_buffer_diff =  [json.loads(x) for x in (current_state_connection_set - transmitted_connection_set)]
+
+        different_items = {
+            "connection_buffer": connection_buffer_diff,
+            "processing_buffer": processing_buffer_diff,
+            "conveyor_params": conveyor_params_diff,
+        }
+
+        if self.transmitted_state == {} or "state_max_size" not in self.transmitted_state:
+            different_items["state_max_size"] = current_state["state_max_size"]
+
+        self.transmitted_state = current_state
+        return different_items
