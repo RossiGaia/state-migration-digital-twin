@@ -174,11 +174,11 @@ class Processing:
                 }
                 self.observations.append(observation_obj)
 
-                logger.info(
+                logger.debug(
                     f"Buffers size in MB:\n\tconnection_buffer: {len(json.dumps(list(self.connection_buffer)).encode("utf-8")) / 1024 / 1024}\n\tprocessing_buffer: {len(json.dumps(list(self.processing_buffer)).encode("utf-8")) / 1024 / 1024} with {len(self.processing_buffer)} number of elements"
                 )
                 # logger.debug(json.dumps(snap, indent=4))
-                logger.debug(
+                logger.info(
                     f"time to elaborate the message: {time.time() - snap["recv_timestamp"]}"
                 )
 
@@ -316,6 +316,7 @@ class Processing:
         return round(health, 1)
 
     def serialize_state(self):
+        start_time = time.time()
         with self.lock:
             state = {
                 "connection_buffer": list(self.connection_buffer),
@@ -323,9 +324,12 @@ class Processing:
                 "conveyor_params": self.conveyor_params,
                 "state_max_size": self.state_max_size,
             }
-            return state
+        serialization_time = time.time() - start_time
+        logger.info(f"Serialization took {serialization_time} seconds.")
+        return state
 
     def deserialize_state(self, serialized_state):
+        start_time = time.time()
         with self.lock:
             try:
                 self.connection_buffer = (
@@ -342,8 +346,12 @@ class Processing:
                     f"Connection buffer -> {serialized_state["connection_buffer"]}"
                 )
                 return -1
+        deserialization_time = time.time() - start_time
+        logger.info(f"Deserialization took {deserialization_time} seconds.")
+        return 0
 
-            return 0
+    def rebuild(self):
+        raise NotImplementedError
 
     def odte_computation(self):
         while self.running:

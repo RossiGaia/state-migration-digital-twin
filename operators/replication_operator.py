@@ -3,13 +3,6 @@ from kubernetes import client
 from kubernetes.utils import create_from_dict
 from k8s_utils import delete_from_dict
 
-CLUSTER_IP = os.environ.get("CLUSTER_IP")
-
-if not CLUSTER_IP:
-    print("CLUSTER_IP env var not present. Exiting.")
-    exit(1)
-
-
 @kopf.on.create("cyberphysicalapplications")
 def create_fn(spec, name, namespace, meta, logger, **kwargs):
     k8s_client = client.ApiClient()
@@ -246,7 +239,7 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
         ensure_pods_ready(
             k8s_core_v1, next_deployment_app_name, next_deployment_namespace, logger
         )
-        print("Deployment's pods started.")
+        logger.info("Deployment's pods started.")
 
         operation_end_time = datetime.datetime.now()
         timestamps.append([operation_name, operation_start_time, operation_end_time])
@@ -259,22 +252,26 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
         resp = k8s_core_v1.list_namespaced_service(
             current_deployment_namespace, label_selector=label_selector
         )
+        current_deployment_service_name = resp.items[0].metadata.name
+        current_deployment_service_namespace = resp.items[0].metadata.namespace
         current_deployment_service_port = resp.items[0].spec.ports[0].node_port
 
         resp = k8s_core_v1.read_namespaced_service(
             next_deployment_service_name, next_deployment_namespace
         )
+        next_deployment_service_namespace = resp.metadata.namespace
         next_deployment_service_port = resp.spec.ports[0].node_port
 
-        service_url = f"http://{CLUSTER_IP}:{current_deployment_service_port}/dump"
-        resp = requests.post(service_url)
+        source_dt_url = f"http://{current_deployment_service_name}.{current_deployment_service_namespace}.svc.cluster.local:{current_deployment_service_port}/state"
+        logger.info(f"Calling: {source_dt_url}")
+        # resp = requests.get(service_url)
 
         # measuring purposes
-        json_object = json.dumps(json.loads(resp.text)).encode("UTF-8")
-        print(
-            f"Size in megabytes of the received state encoded in UTF-8: {len(json_object) / 1024 / 1024}"
-        )
-        print(f"No. of messages {len(json.loads(resp.text)["dump"]["messages_deque"])}")
+        # json_object = json.dumps(json.loads(resp.text)).encode("UTF-8")
+        # print(
+        #     f"Size in megabytes of the received state encoded in UTF-8: {len(json_object) / 1024 / 1024}"
+        # )
+        # print(f"No. of messages {len(json.loads(resp.text)["dump"]["messages_deque"])}")
 
         operation_end_time = datetime.datetime.now()
         timestamps.append([operation_name, operation_start_time, operation_end_time])
@@ -283,12 +280,13 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
         operation_start_time = operation_end_time
 
         # restore the state in the new instance
-        next_service_url = f"http://{CLUSTER_IP}:{next_deployment_service_port}/restore"
+        next_service_url = f"http://{next_deployment_service_name}.{next_deployment_service_namespace}.svc.cluster.local:{next_deployment_service_port}/state"
+        logger.info(f"Calling: {next_service_url}")
         headers = {"Content-Type": "application/json"}
 
-        data = resp.text
-        resp = requests.post(next_service_url, data=data, headers=headers)
-        print(resp.text)
+        # data = resp.text
+        # resp = requests.post(next_service_url, data=data, headers=headers)
+        # print(resp.text)
 
         operation_end_time = datetime.datetime.now()
         timestamps.append([operation_name, operation_start_time, operation_end_time])

@@ -7,7 +7,9 @@ from flask import Flask, jsonify, request
 import yaml
 import logging
 import time
-
+import requests
+import json
+import os
 
 logging.basicConfig(
     format="%(asctime)s,%(msecs)03d %(name)s %(levelname)s %(message)s",
@@ -28,6 +30,9 @@ connection_buffer_conf = connection_conf["buffer"]["size"]
 connection_mqtt_conf = connection_conf["mqtt"]
 
 state_max_size = confs["state"]["max_size_mb"]
+
+# check if migrated dt
+source_dt_url = os.environ.get("SOURCE_DT_URL")
 
 metrics_file_name = f"{confs["name"]}_{confs["metrics"]["file_name"]}"
 with open(metrics_file_name, "a") as metrics_file:
@@ -68,6 +73,26 @@ mqtt_t.start()
 processing_t = threading.Thread(target=processing.run)
 processing_t.start()
 
+# recover state
+if source_dt_url is not None:
+    restore_start_timestamp = time.time()
+    try:
+        response = requests.get(source_dt_url)
+        serialized_state = json.loads(response.text)["state"]
+    except:
+        logger.error("Error in the state request.")
+        
+
+    result = processing.deserialize_state(serialized_state)
+    restore_end_timestamp = time.time()
+    
+    if result == 0:
+        with open(metrics_file_name, "a") as metrics_file:
+            metrics_file.write(
+                f"Restoring total time: {restore_end_timestamp - restore_start_timestamp}. Started at {restore_start_timestamp}, ended at {restore_end_timestamp}.\n"
+            )
+    else:
+        logger.error("Error in the state deserialization.")
 
 @app.route("/state", methods=["GET"])
 def get_state():
@@ -97,7 +122,6 @@ def set_state():
     else:
         return jsonify({"status": "error"})
 
-
 @app.route("/healthd")
 def health_check():
     return jsonify({"status": "healthy"}), 200
@@ -117,4 +141,4 @@ if __name__ == "__main__":
             f"Starting service at {time.time()}.\n"
         )
 
-    app.run(host="0.0.0.0", port=5002)
+    app.run(host="0.0.0.0", port=5003)
