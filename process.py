@@ -457,21 +457,22 @@ class Processing:
 
 
     def process_delta(self, different_items):
-        new_conveyor_params = different_items["conveyor_params"]
-        for key, value in new_conveyor_params.items():
-            current_value = getattr(self.conveyor_params, key)
-            if current_value != value:
-                setattr(self.conveyor_params, key, value)
+        with self.lock():
+            new_conveyor_params = different_items["conveyor_params"]
+            for key, value in new_conveyor_params.items():
+                current_value = getattr(self.conveyor_params, key)
+                if current_value != value:
+                    setattr(self.conveyor_params, key, value)
 
-        
-        new_conn_buffer = different_items["connection_buffer"]
-        self.connection_buffer = collections.deque(
-            new_conn_buffer,
-            maxlen=self.connection_buffer.maxlen
-        )
+            
+            new_conn_buffer = different_items["connection_buffer"]
+            self.connection_buffer = collections.deque(
+                new_conn_buffer,
+                maxlen=self.connection_buffer.maxlen
+            )
 
-        new_proc_buffer = different_items["processing_buffer"]
-        self.processing_buffer.extend(new_proc_buffer)
+            new_proc_buffer = different_items["processing_buffer"]
+            self.processing_buffer.extend(new_proc_buffer)
 
     def compute_prime_numbers(self, max_n: int):
         for i in range(3, max_n + 1):

@@ -36,7 +36,7 @@ state_max_size = confs["state"]["max_size_mb"]
 # check if migrated dt
 source_dt_url = os.environ.get("SOURCE_DT_URL")
 
-metrics_file_name = f"{confs["name"]}_{confs["metrics"]["file_name"]}"
+metrics_file_name = f"{confs['name']}_{confs['metrics']['file_name']}"
 with open(metrics_file_name, "a") as metrics_file:
     metrics_file.write("Log started.\n")
 
@@ -140,7 +140,16 @@ def odte():
 @app.route("/delta")
 def get_delta():
     delta = processing.get_delta()
-    return jsonify({"delta": delta})
+    return jsonify(delta)
+
+@app.route("/delta", methods=["POST"])
+def process_delta():
+    different_items = request.get_json()
+    try:
+        processing.process_delta(different_items)
+        return jsonify({"message": "Success."}), 201
+    except Exception:
+        return jsonify({"message": "Exception in processing delta."}), 500
 
 if __name__ == "__main__":
     logger.debug("Started main.")
