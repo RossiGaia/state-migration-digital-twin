@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: criu-proxy
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: criu-proxy
+  template:
+    metadata:
+      labels:
+        app: criu-proxy
+    spec:
+      hostNetwork: true
+      serviceAccountName: kubelet-access
+
+      containers:
+      - name: proxy
+        image: curlimages/curl:latest
+        command: ["/bin/sh", "-c"]
+        args:
+          - |
+            echo "CRIU proxy ready on node";
+            sleep infinity

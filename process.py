@@ -5,6 +5,7 @@ import json
 import collections
 import threading
 import json
+import queue
 
 logging.basicConfig(
     format="%(asctime)s,%(msecs)03d %(name)s %(levelname)s %(message)s",
@@ -33,7 +34,15 @@ class VirtualizedConveyorPlant:
 
 
 class Processing:
-    def __init__(self, *, connection_buffer, processing_buffer, state_max_size=None):
+    def __init__(
+        self,
+        *,
+        connection_buffer,
+        processing_buffer,
+        state_max_size=None,
+        worker=0,
+        work=0,
+    ):
         self.connection_buffer = connection_buffer
         self.processing_buffer = processing_buffer
         self.observations = collections.deque(maxlen=100)
@@ -44,6 +53,19 @@ class Processing:
         self.odte = None
         self.lock = threading.Lock()
         self.transmitted_state = {}
+        self.burn_worker = worker
+        self.burn_work = work
+        self.burn_queue = queue.Queue()
+        self.burn_threads = []
+        self.processing_seq_no = 0
+        self.last_transmitted_processing_seq_no = -1
+
+
+        if self.burn_worker > 0 and self.burn_work > 0:
+            for i in range(self.burn_worker):
+                t = threading.Thread(target=self.burn_worker_loop, daemon=True)
+                t.start()
+                self.burn_threads.append(t)
 
     def run(self):
         """
@@ -57,6 +79,11 @@ class Processing:
         while self.running:
 
             if len(self.connection_buffer) > 0:
+
+                if self.burn_worker > 0 and self.burn_work > 0:
+                    for _ in range(self.burn_worker):
+                        self.burn_queue.put(self.burn_work)
+
                 raw_msg = None
                 try:
                     message_processing_start = time.time()
@@ -158,6 +185,9 @@ class Processing:
                 snap["creation_timestamp"] = raw_msg["payload"]["creation_timestamp"]
                 snap["key"] = raw_msg["key"]
 
+                snap["seq_id"] = self.processing_seq_no
+                self.processing_seq_no += 1
+
                 snap_size = len(json.dumps(snap))
 
                 if self.state_max_size:
@@ -178,13 +208,19 @@ class Processing:
                 }
                 self.observations.append(observation_obj)
 
-                logger.debug(
-                    f"Buffers size in MB:\n\tconnection_buffer: {len(json.dumps(list(self.connection_buffer)).encode("utf-8")) / 1024 / 1024}\n\tprocessing_buffer: {len(json.dumps(list(self.processing_buffer)).encode("utf-8")) / 1024 / 1024} with {len(self.processing_buffer)} number of elements"
-                )
+                # logger.debug(
+                #     f"Buffers size in MB:\n\tconnection_buffer: {len(json.dumps(list(self.connection_buffer)).encode('utf-8')) / 1024 / 1024}\n\tprocessing_buffer: {len(json.dumps(list(self.processing_buffer)).encode('utf-8')) / 1024 / 1024} with {len(self.processing_buffer)} number of elements"
+                # )
+
+                if self.burn_worker > 0 and self.burn_work > 0:
+                    self.burn_queue.join()
+
                 # logger.debug(json.dumps(snap, indent=4))
                 logger.info(
-                    f"time to elaborate the message: {time.time() - snap["recv_timestamp"]}"
+                    f"time to elaborate the message: {time.time() - snap['recv_timestamp']}"
                 )
+            else:
+                time.sleep(0.001)
 
     def generate_padding(self, max_size, current_size):
         buffer_max_length = self.processing_buffer.maxlen
@@ -249,6 +285,8 @@ class Processing:
 
     def stop(self):
         self.running = False
+        for _ in range(self.burn_worker):
+            self.burn_queue.put(None)
 
     def _safe_float(self, value, default=0.0):
         """Coerce to float safely."""
@@ -325,8 +363,10 @@ class Processing:
             state = {
                 "connection_buffer": list(self.connection_buffer),
                 "processing_buffer": list(self.processing_buffer),
-                "conveyor_params": self.conveyor_params,
+                "conveyor_params": asdict(self.conveyor_params),
                 "state_max_size": self.state_max_size,
+                "connection_buffer_maxlen": self.connection_buffer.maxlen,
+                "processing_buffer_maxlen": self.processing_buffer.maxlen,
             }
         serialization_time = time.time() - start_time
         logger.info(f"Serialization took {serialization_time} seconds.")
@@ -336,18 +376,24 @@ class Processing:
         start_time = time.time()
         with self.lock:
             try:
-                self.connection_buffer = (
-                    list([])
-                    if len(serialized_state["connection_buffer"]) == 0
-                    else serialized_state["connection_buffer"]
+                connection_buffer_maxlen = serialized_state["connection_buffer_maxlen"]
+                processing_buffer_maxlen = serialized_state["processing_buffer_maxlen"]
+                self.connection_buffer = collections.deque(
+                    serialized_state["connection_buffer"],
+                    maxlen=connection_buffer_maxlen,
                 )
-                self.processing_buffer = serialized_state["processing_buffer"]
-                self.conveyor_params = serialized_state["conveyor_params"]
+                self.processing_buffer = collections.deque(
+                    serialized_state["processing_buffer"],
+                    maxlen=processing_buffer_maxlen,
+                )
+                self.conveyor_params = VirtualizedConveyorPlant(
+                    **serialized_state["conveyor_params"]
+                )
                 self.state_max_size = serialized_state["state_max_size"]
             except Exception as e:
                 logger.error(f"Error in deserialization. {e}")
                 logger.error(
-                    f"Connection buffer -> {serialized_state["connection_buffer"]}"
+                    f"Connection buffer -> {serialized_state['connection_buffer']}"
                 )
                 return -1
         deserialization_time = time.time() - start_time
@@ -371,46 +417,69 @@ class Processing:
 
     def get_delta(self):
         current_state = self.serialize_state()
-        conveyor_params_diff = {}
         current_conveyor_params = current_state["conveyor_params"]
-        transmitted_conveyor_params = (
-            self.transmitted_state["conveyor_params"]
-            if self.transmitted_state != {}
-            else VirtualizedConveyorPlant()
-        )
-
-
-        for f in fields(current_conveyor_params):
-            name = f.name
-            current = getattr(current_conveyor_params, name)
-            transmitted = getattr(transmitted_conveyor_params, name, None)
-            if current != transmitted:
-                conveyor_params_diff[name] = current
-
-        # difference between processing buffer 
-        current_state_processing_set = {json.dumps(element) for element in current_state["processing_buffer"]}
         if self.transmitted_state == {}:
-            transmitted_processing_set = set()
+            transmitted_conveyor_params = {}
         else:
-            transmitted_processing_set = {json.dumps(element) for element in self.transmitted_state["processing_buffer"]}
-        processing_buffer_diff =  [json.loads(x) for x in (current_state_processing_set - transmitted_processing_set)]
+            transmitted_conveyor_params = self.transmitted_state.get(
+                "conveyor_params", {}
+            )
 
-        # difference between connection buffer
-        current_state_connection_set = {json.dumps(element) for element in current_state["connection_buffer"]}
-        if self.transmitted_state == {}:
-            transmitted_connection_set = set()
-        else:
-            transmitted_connection_set = {json.dumps(element) for element in self.transmitted_state["connection_buffer"]}
-        connection_buffer_diff =  [json.loads(x) for x in (current_state_connection_set - transmitted_connection_set)]
+        conveyor_params_diff = {}
+        for name, current_value in current_conveyor_params.items():
+            transmitted_value = transmitted_conveyor_params.get(name)
+            if current_value != transmitted_value:
+                conveyor_params_diff[name] = current_value
+
+        # processing buffer
+        current_proc_buffer = current_state["processing_buffer"]
+        new_proc_buffer = []
+        max_seq_seen = self.last_transmitted_processing_seq_no
+
+        for entry in current_proc_buffer:
+            seq = entry.get("seq_id")
+            if seq > self.last_transmitted_processing_seq_no:
+                new_proc_buffer.append(entry)
+                if seq > max_seq_seen:
+                    max_seq_seen = seq
+
+
+        # connection buffer
+        current_conn_buffer = current_state["connection_buffer"]
 
         different_items = {
-            "connection_buffer": connection_buffer_diff,
-            "processing_buffer": processing_buffer_diff,
+            "connection_buffer": current_conn_buffer,
+            "processing_buffer": new_proc_buffer,
             "conveyor_params": conveyor_params_diff,
         }
 
-        if self.transmitted_state == {} or "state_max_size" not in self.transmitted_state:
+        prev_state_max_size = (
+            None
+            if self.transmitted_state == {}
+            else self.transmitted_state.get("state_max_size")
+        )
+        if prev_state_max_size != current_state["state_max_size"]:
             different_items["state_max_size"] = current_state["state_max_size"]
 
         self.transmitted_state = current_state
+        self.last_transmitted_processing_seq_no = max_seq_seen
+
         return different_items
+
+
+    def compute_prime_numbers(self, max_n: int):
+        for i in range(3, max_n + 1):
+            is_prime = True
+            for j in range(2, int(i**0.5) + 1):
+                if i % j == 0:
+                    is_prime = False
+                    break
+
+    def burn_worker_loop(self):
+        while self.running:
+            work = self.burn_queue.get()
+            if work is None:
+                self.burn_queue.task_done()
+                break
+            self.compute_prime_numbers(work)
+            self.burn_queue.task_done()
