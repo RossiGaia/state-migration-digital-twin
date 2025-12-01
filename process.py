@@ -68,11 +68,6 @@ class Processing:
                 self.burn_threads.append(t)
 
     def run(self):
-        """
-        Drain connection_buffer, update virtual twin, compute KPIs, and append snapshots.
-        Each processing_buffer item is a compact dict with raw + derived fields.
-        """
-
         odte_t = threading.Thread(target=self.odte_computation, daemon=True)
         odte_t.start()
 
@@ -123,7 +118,7 @@ class Processing:
                 )
                 pt_metrics.wear = status.get("wear", pt_metrics.wear)
 
-                snap = self._snapshot()
+                snap = asdict(self.conveyor_params)
 
                 # Derived metrics (per-sample)
                 # Instantaneous mechanical power proxy: P ≈ T * ω (units: N·m * rad/s = W),
@@ -180,21 +175,20 @@ class Processing:
                     ),
                 }
 
-                snap["processed_timestamp"] = time.time() - message_processing_start
                 snap["recv_timestamp"] = raw_msg["recv_timestamp"]
                 snap["creation_timestamp"] = raw_msg["payload"]["creation_timestamp"]
                 snap["key"] = raw_msg["key"]
-
                 snap["seq_id"] = self.processing_seq_no
                 self.processing_seq_no += 1
 
-                snap_size = len(json.dumps(snap))
+                snap_size = len(json.dumps(snap).encode("utf-8"))
 
                 if self.state_max_size:
                     snap["padding"] = self.generate_padding(
                         self.state_max_size, snap_size
                     )
 
+                snap["processed_timestamp"] = time.time() - message_processing_start
                 self.processing_buffer.append(snap)
 
                 observation_obj = {
@@ -215,9 +209,10 @@ class Processing:
                 if self.burn_worker > 0 and self.burn_work > 0:
                     self.burn_queue.join()
 
+
                 # logger.debug(json.dumps(snap, indent=4))
                 logger.info(
-                    f"time to elaborate the message: {time.time() - snap['recv_timestamp']}"
+                    f"time to elaborate the message: {time.time() - snap['process_timestamp']}"
                 )
             else:
                 time.sleep(0.001)
@@ -296,12 +291,6 @@ class Processing:
             return float(value)
         except (TypeError, ValueError):
             return float(default)
-
-    def _snapshot(self):
-        """Return a plain dict snapshot of current params (JSON-friendly)."""
-        snap = asdict(self.conveyor_params)
-        snap["timestamp"] = time.time()
-        return snap
 
     def _rolling_stats(self, key):
         """Rolling mean + slope over a recent window (optional)."""
@@ -426,10 +415,10 @@ class Processing:
             )
 
         conveyor_params_diff = {}
-        for name, current_value in current_conveyor_params.items():
-            transmitted_value = transmitted_conveyor_params.get(name)
-            if current_value != transmitted_value:
-                conveyor_params_diff[name] = current_value
+        for key, value in current_conveyor_params.items():
+            transmitted_value = transmitted_conveyor_params[key]
+            if value != transmitted_value:
+                conveyor_params_diff[key] = value
 
         # processing buffer
         current_proc_buffer = current_state["processing_buffer"]
@@ -437,7 +426,7 @@ class Processing:
         max_seq_seen = self.last_transmitted_processing_seq_no
 
         for entry in current_proc_buffer:
-            seq = entry.get("seq_id")
+            seq = entry["seq_id"]
             if seq > self.last_transmitted_processing_seq_no:
                 new_proc_buffer.append(entry)
                 if seq > max_seq_seen:

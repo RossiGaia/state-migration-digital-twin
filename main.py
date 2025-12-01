@@ -24,6 +24,8 @@ conf_path = "config.yaml"
 confs = yaml.safe_load(open(conf_path))
 process_conf = confs["process"]
 process_buffer_conf = process_conf["buffer"]["size"]
+process_burn_worker = process_conf["burn"]["workers"]
+process_burn_work = process_conf["burn"]["work"]
 
 connection_conf = confs["connections"]
 connection_buffer_conf = connection_conf["buffer"]["size"]
@@ -65,6 +67,8 @@ processing = Processing(
     connection_buffer=connection_buffer,
     processing_buffer=processing_buffer,
     state_max_size=state_max_size,
+    worker=process_burn_worker,
+    work=process_burn_work
 )
 
 mqtt_t = threading.Thread(target=mqtt_connection.run)
