@@ -60,7 +60,6 @@ class Processing:
         self.processing_seq_no = 0
         self.last_transmitted_processing_seq_no = -1
 
-
         if self.burn_worker > 0 and self.burn_work > 0:
             for i in range(self.burn_worker):
                 t = threading.Thread(target=self.burn_worker_loop, daemon=True)
@@ -120,6 +119,12 @@ class Processing:
 
                 snap = asdict(self.conveyor_params)
 
+                snap["recv_timestamp"] = raw_msg["recv_timestamp"]
+                snap["creation_timestamp"] = raw_msg["payload"]["creation_timestamp"]
+                snap["key"] = raw_msg["key"]
+                snap["seq_id"] = self.processing_seq_no
+                self.processing_seq_no += 1
+
                 # Derived metrics (per-sample)
                 # Instantaneous mechanical power proxy: P ≈ T * ω (units: N·m * rad/s = W),
                 # but we don't have shaft torque; approximate with belt_tension and a nominal pulley radius.
@@ -175,12 +180,6 @@ class Processing:
                     ),
                 }
 
-                snap["recv_timestamp"] = raw_msg["recv_timestamp"]
-                snap["creation_timestamp"] = raw_msg["payload"]["creation_timestamp"]
-                snap["key"] = raw_msg["key"]
-                snap["seq_id"] = self.processing_seq_no
-                self.processing_seq_no += 1
-
                 snap_size = len(json.dumps(snap).encode("utf-8"))
 
                 if self.state_max_size:
@@ -209,10 +208,9 @@ class Processing:
                 if self.burn_worker > 0 and self.burn_work > 0:
                     self.burn_queue.join()
 
-
                 # logger.debug(json.dumps(snap, indent=4))
                 logger.info(
-                    f"time to elaborate the message: {time.time() - snap['process_timestamp']}"
+                    f"time to elaborate the message: {time.time() - snap['processed_timestamp']}"
                 )
             else:
                 time.sleep(0.001)
@@ -302,7 +300,7 @@ class Processing:
 
         xs = list(buf)[-window:]
         ys = [row.get(key) for row in xs if row.get(key) is not None]
-        ts = [row["timestamp"] for row in xs if row.get(key) is not None]
+        ts = [row["recv_timestamp"] for row in xs if row.get(key) is not None]
         if len(ys) < 2:
             return {"mean": sum(ys) / len(ys) if ys else None, "slope_per_s": None}
 
@@ -416,8 +414,11 @@ class Processing:
 
         conveyor_params_diff = {}
         for key, value in current_conveyor_params.items():
-            transmitted_value = transmitted_conveyor_params[key]
-            if value != transmitted_value:
+            if key in transmitted_conveyor_params:
+                transmitted_value = transmitted_conveyor_params[key]
+                if value != transmitted_value:
+                    conveyor_params_diff[key] = value
+            else:
                 conveyor_params_diff[key] = value
 
         # processing buffer
@@ -431,7 +432,6 @@ class Processing:
                 new_proc_buffer.append(entry)
                 if seq > max_seq_seen:
                     max_seq_seen = seq
-
 
         # connection buffer
         current_conn_buffer = current_state["connection_buffer"]
@@ -455,20 +455,19 @@ class Processing:
 
         return different_items
 
-
     def process_delta(self, different_items):
-        with self.lock():
+        logger.debug("Started proccess_delta.")
+        with self.lock:
+            logger.debug("Lock acquired.")
             new_conveyor_params = different_items["conveyor_params"]
             for key, value in new_conveyor_params.items():
                 current_value = getattr(self.conveyor_params, key)
                 if current_value != value:
                     setattr(self.conveyor_params, key, value)
 
-            
             new_conn_buffer = different_items["connection_buffer"]
             self.connection_buffer = collections.deque(
-                new_conn_buffer,
-                maxlen=self.connection_buffer.maxlen
+                new_conn_buffer, maxlen=self.connection_buffer.maxlen
             )
 
             new_proc_buffer = different_items["processing_buffer"]

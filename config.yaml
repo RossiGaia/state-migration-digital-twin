@@ -19,7 +19,7 @@ process:
     work: 1000
 
 state:
-  max_size_mb: 2
+  max_size_mb: 1
 
 
 metrics:
