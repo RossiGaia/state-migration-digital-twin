@@ -3,9 +3,8 @@ Description=CRIU Agent
 After=network.target
 
 [Service]
-ExecStart=/usr/bin/python3 /home/ubuntu/agent/criu-agent
+ExecStart=/usr/bin/python3 /home/ubuntu/agent/criu_api_flask.py
 Restart=always
-User=root
 
 [Install]
 WantedBy=multi-user.target

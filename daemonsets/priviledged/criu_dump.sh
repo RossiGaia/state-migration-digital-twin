@@ -5,12 +5,13 @@ set -euo pipefail
 
 URL="https://127.0.0.1:10250/checkpoint/${CRIU_DUMP_NAMESPACE}/${CRIU_DUMP_POD_NAME}/${CRIU_DUMP_CONTAINER_NAME}"
 
-if curl -k -X POST \
+if curl -k -f -X POST \
     -H "Authorization: Bearer ${CRIU_DUMP_TOKEN}" \
     "${URL}"; then
     echo "Dump successful."
 else
     echo "Dump failed."
+    exit 1
 fi
 
 # Image creation with buildah
