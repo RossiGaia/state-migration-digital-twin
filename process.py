@@ -466,9 +466,7 @@ class Processing:
                     setattr(self.conveyor_params, key, value)
 
             new_conn_buffer = different_items["connection_buffer"]
-            self.connection_buffer = collections.deque(
-                new_conn_buffer, maxlen=self.connection_buffer.maxlen
-            )
+            self.connection_buffer.append(new_conn_buffer)
 
             new_proc_buffer = different_items["processing_buffer"]
             self.processing_buffer.extend(new_proc_buffer)

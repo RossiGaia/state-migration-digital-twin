@@ -33,23 +33,25 @@ connection_mqtt_conf = connection_conf["mqtt"]
 
 state_max_size = confs["state"]["max_size_mb"]
 
-# check if migrated dt
-source_dt_url = os.environ.get("SOURCE_DT_URL")
-
 metrics_file_name = f"{confs['name']}_{confs['metrics']['file_name']}"
 with open(metrics_file_name, "a") as metrics_file:
     metrics_file.write("Log started.\n")
 
+
 def graceful_shutdown(signum, frame):
     processing.stop()
-    processing_t.join()
+    try:
+        processing_t.join()
+    except:
+        pass
 
     mqtt_connection.stop()
-    mqtt_t.join()
+    try:
+        mqtt_t.join()
+    except:
+        pass
     with open(metrics_file_name, "a") as metrics_file:
-        metrics_file.write(
-            f"Stopped serving at {time.time()}.\n"
-        )
+        metrics_file.write(f"Stopped serving at {time.time()}.\n")
     exit(0)
 
 
@@ -68,35 +70,49 @@ processing = Processing(
     processing_buffer=processing_buffer,
     state_max_size=state_max_size,
     worker=process_burn_worker,
-    work=process_burn_work
+    work=process_burn_work,
 )
+
+
+# check if migrated dt
+source_dt_url_delta = os.environ.get("SOURCE_DT_URL_DELTA")
+source_dt_url_disconnect = os.environ.get("SOURCE_DT_URL_DISCONNECT")
+if source_dt_url_delta:
+
+    restore_start_timestamp = time.time()
+    # start requesting delta
+    logger.info("DT is migrated. Starting live migration.")
+    max_rounds = int(confs["migration"]["live"]["rounds"])
+    for i in range(max_rounds - 1):
+        resp = requests.get(source_dt_url_delta)
+        obj = json.loads(resp.text)
+        processing.process_delta(obj)
+        time.sleep(1)
+
+    # call disconnect on old dt
+    logger.debug("Disconnecting source DT.")
+    resp = requests.post(source_dt_url_disconnect)
+    if resp.status_code != 200:
+        logger.error("Error in disconnecting the source DT")
+        exit(1)
+
+    # call last delta
+    logger.debug("Calling last delta.")
+    resp = requests.get(source_dt_url_delta)
+    obj = json.loads(resp.text)
+    processing.process_delta(obj)
+
+    restore_end_timestamp = time.time()
+    with open(metrics_file_name, "a") as metrics_file:
+        metrics_file.write(
+            f"Restoring total time: {restore_end_timestamp - restore_start_timestamp}. Started at {restore_start_timestamp}, ended at {restore_end_timestamp}.\n"
+        )
 
 mqtt_t = threading.Thread(target=mqtt_connection.run)
 mqtt_t.start()
 
 processing_t = threading.Thread(target=processing.run)
 processing_t.start()
-
-# recover state
-if source_dt_url is not None:
-    restore_start_timestamp = time.time()
-    try:
-        response = requests.get(source_dt_url)
-        serialized_state = json.loads(response.text)["state"]
-    except:
-        logger.error("Error in the state request.")
-        
-
-    result = processing.deserialize_state(serialized_state)
-    restore_end_timestamp = time.time()
-    
-    if result == 0:
-        with open(metrics_file_name, "a") as metrics_file:
-            metrics_file.write(
-                f"Restoring total time: {restore_end_timestamp - restore_start_timestamp}. Started at {restore_start_timestamp}, ended at {restore_end_timestamp}.\n"
-            )
-    else:
-        logger.error("Error in the state deserialization.")
 
 @app.route("/state", methods=["GET"])
 def get_state():
@@ -116,7 +132,7 @@ def set_state():
     serialized_state = request.get_json()["state"]
     result = processing.deserialize_state(serialized_state)
     restore_end_timestamp = time.time()
-    
+
     with open(metrics_file_name, "a") as metrics_file:
         metrics_file.write(
             f"Restoring total time: {restore_end_timestamp - restore_start_timestamp}. Started at {restore_start_timestamp}, ended at {restore_end_timestamp}.\n"
@@ -125,6 +141,15 @@ def set_state():
         return jsonify({"status": "success"})
     else:
         return jsonify({"status": "error"})
+
+@app.route("/disconnect", methods=["POST"])
+def disconnect():
+    try:
+        mqtt_connection.stop()
+    except:
+        return jsonify({"status": "error"})
+    
+    return jsonify({"status": "success"})
 
 @app.route("/healthd")
 def health_check():
@@ -142,6 +167,7 @@ def get_delta():
     delta = processing.get_delta()
     return jsonify(delta)
 
+
 @app.route("/delta", methods=["POST"])
 def process_delta():
     different_items = request.get_json()
@@ -151,12 +177,11 @@ def process_delta():
     except Exception:
         return jsonify({"message": "Exception in processing delta."}), 500
 
+
 if __name__ == "__main__":
     logger.debug("Started main.")
 
     with open(metrics_file_name, "a") as metrics_file:
-        metrics_file.write(
-            f"Starting service at {time.time()}.\n"
-        )
+        metrics_file.write(f"Starting service at {time.time()}.\n")
 
     app.run(host="0.0.0.0", port=5003)

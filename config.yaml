@@ -22,5 +22,9 @@ state:
   max_size_mb: 1
 
 
+migration:
+  live:
+    rounds: 10
+
 metrics:
   file_name: "metrics.log"
