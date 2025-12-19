@@ -41,6 +41,7 @@ class MqttConnection:
             "recv_timestamp": time.time(),
             "key": ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
         }
+        logger.debug(f"Received message with seq_id: {json.loads(msg.payload)["seq_id"]}")
         self.connection_buffer.append(data)
 
     def run(self):
