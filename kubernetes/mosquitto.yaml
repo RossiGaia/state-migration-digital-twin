@@ -1,3 +1,16 @@
+---
+
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mosquitto-confs
+data:
+  mosquitto.conf: |
+    listener 1883
+    allow_anonymous true
+
+---
+
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -23,6 +36,14 @@ spec:
             memory: "256Mi"
         ports:
         - containerPort: 1883
+        volumeMounts:
+          - name: mosquitto-configfile
+            mountPath: /mosquitto/config/
+
+      volumes:
+        - name: mosquitto-configfile
+          configMap:
+            name: mosquitto-confs
 
 ---
 
@@ -36,3 +57,4 @@ spec:
   ports:
   - port: 1883
     targetPort: 1883
+
