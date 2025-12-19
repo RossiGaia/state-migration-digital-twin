@@ -19,7 +19,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-conf_path = "config.yaml"
+conf_path = "/app/dt/configs/config.yaml"
 
 confs = yaml.safe_load(open(conf_path))
 process_conf = confs["process"]

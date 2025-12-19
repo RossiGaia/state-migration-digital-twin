@@ -7,6 +7,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     pip3 install -r requirements.txt
 
 COPY ./main.py /app
+COPY ./connections.py /app
+COPY ./process.py /app
 
 ENTRYPOINT ["python3"]
 CMD ["main.py"]

@@ -2,7 +2,7 @@ name: "DT1_ABCDEF"
 
 connections:
   mqtt:
-    broker_url: "localhost"
+    broker_url: "mosquitto"
     port: 1883
     topics:
     - "test/#"
