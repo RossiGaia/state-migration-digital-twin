@@ -215,6 +215,9 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
     pod_name = current_pod_name
     container_name = current_container_name
     token = os.environ.get("KUBELET_ACCESS_TOKEN", None)
+    if not token:
+        logger.error(f"Token for kubelet access is not set.")
+        return
 
     headers = {
         "Content-Type": "application/json"
