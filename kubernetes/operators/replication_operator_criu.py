@@ -198,38 +198,40 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
     resp = k8s_core_v1.list_namespaced_pod(
             namespace, label_selector=label_selector
         )
-    node_name = resp.items[0].spec.node_name
+
+    if len(resp.items) <= 0:
+        logger.error(f"No namespaced pods found. Unable to get pod name, container name and host ip.")
+        return
+    
+    # node_name = resp.items[0].spec.node_name
     current_pod_name = resp.items[0].metadata.name
     current_container_name = resp.items[0].spec.containers[0].name
-    
-    # get daemon pod name
-    daemon_namespace = "kube-system"
-    daemon_label_selector = "app=criu-proxy"
-
-    resp = k8s_core_v1.list_namespaced_pod(
-            daemon_namespace, label_selector=daemon_label_selector
-        )
-
     host_ip = resp.items[0].status.host_ip
+
+
+    # call the checkpoint api
     checkpoint_url = f"http://{host_ip}:9000/checkpoint"
     namespace = current_deployment_namespace       
-    
     pod_name = current_pod_name
     container_name = current_container_name
     token = os.environ.get("KUBELET_ACCESS_TOKEN", None)
+
     headers = {
         "Content-Type": "application/json"
     }
-
     data = {
         "namespace": namespace,
         "pod": pod_name,
         "container": container_name,
         "token": token
     }
-    
+
     resp = requests.post(checkpoint_url, headers=headers, data=json.dumps(data))
     print(resp.text)
+
+    if resp.status_code == 500:
+        logger.error(f"Error in the checkpoint call.")
+        return
 
     new_image_name = f"rssgai/checkpoint-image:{pod_name}_{container_name}"
     print(new_image_name)
@@ -261,8 +263,9 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
                 {"nodeSelector": {"zone": f"{next_deployment_affinity}"}}
             )
 
+            # image ovveride
             config["spec"]["template"]["spec"]["containers"][0]["image"] = new_image_name
-            config["spec"]["template"]["spec"]["containers"][0].pop("command", None)
+            # config["spec"]["template"]["spec"]["containers"][0].pop("command", None)
 
             next_deployment_namespace = config.get("metadata").get("namespace")
             next_deployment_app_name = (
@@ -299,14 +302,6 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
         except:
             logger.exception("Exception creating new object.")
 
-
-    kopf.label(next_deployment_service, {"debug": "current-service"})
-    resp = k8s_core_v1.patch_namespaced_service(
-        next_deployment_service_name,
-        next_deployment_namespace,
-        next_deployment_service,
-    )
-
     group = "test.dev"
     version = "v1"
     plural = "cyberphysicalapplications"
@@ -319,6 +314,13 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
         k8s_core_v1, next_deployment_app_name, next_deployment_namespace, logger
     )
     logger.info("Deployment's pods started.")
+
+    kopf.label(next_deployment_service, {"debug": "current-service"})
+    resp = k8s_core_v1.patch_namespaced_service(
+        next_deployment_service_name,
+        next_deployment_namespace,
+        next_deployment_service,
+    )
 
     operation_end_time = datetime.datetime.now()
     timestamps.append([operation_name, operation_start_time, operation_end_time])
