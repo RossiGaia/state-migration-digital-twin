@@ -19,8 +19,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-conf_path = "/app/dt/configs/config.yaml"
-
+# conf_path = "/app/dt/configs/config.yaml"
+conf_path = "./config.yaml"
 confs = yaml.safe_load(open(conf_path))
 process_conf = confs["process"]
 process_buffer_conf = process_conf["buffer"]["size"]
@@ -146,6 +146,19 @@ def set_state():
 def disconnect():
     try:
         mqtt_connection.stop()
+        mqtt_t.join()
+    except:
+        return jsonify({"status": "error"})
+    
+    return jsonify({"status": "success"})
+
+@app.route("/reconnect", methods=["POST"])
+def reconnect():
+    global mqtt_t
+    try:
+        mqtt_connection.mqtt_loop_run = True
+        mqtt_t = threading.Thread(target=mqtt_connection.run)
+        mqtt_t.start()
     except:
         return jsonify({"status": "error"})
     

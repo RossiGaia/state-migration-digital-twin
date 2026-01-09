@@ -18,15 +18,18 @@ class MqttConnection:
 
     def __init__(self, *, connection_buffer, mqtt_conf):
         self.mqtt_loop_run = True
-        self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        self.mqtt_client = None
 
         self.connection_buffer = connection_buffer
 
-        self.mqtt_client.on_connect = self.on_connect
-        self.mqtt_client.on_message = self.on_message
         self.mqtt_broker_url = mqtt_conf["broker_url"]
         self.mqtt_port = mqtt_conf["port"]
         self.mqtt_topics = mqtt_conf["topics"]
+
+    def new_client(self):
+        self.mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        self.mqtt_client.on_connect = self.on_connect
+        self.mqtt_client.on_message = self.on_message
 
     def on_connect(self, client, userdata, flags, reason_code, properties):
         logger.info(f"connected to {self.mqtt_broker_url} at port {self.mqtt_port}.")
@@ -45,16 +48,21 @@ class MqttConnection:
         self.connection_buffer.append(data)
 
     def run(self):
+        self.new_client()
         logger.debug(f"connecting to {self.mqtt_broker_url} at {self.mqtt_port}.")
         self.mqtt_client.connect(self.mqtt_broker_url, self.mqtt_port)
         self.mqtt_client.loop_start()
 
         while self.mqtt_loop_run:
-            continue
+            time.sleep(0.05)
 
         logger.debug("mqtt disconnection.")
-        self.mqtt_client.loop_stop()
-        self.mqtt_client.disconnect()
+        try:
+            self.mqtt_client.disconnect()
+        finally:
+            self.mqtt_client.loop_stop()
+
+        self.mqtt_client = None
         return
 
     def stop(self):
