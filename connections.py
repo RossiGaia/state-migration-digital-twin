@@ -9,12 +9,6 @@ import threading
 import collections
 import sys
 
-logging.basicConfig(
-    format="%(asctime)s,%(msecs)03d %(name)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    level=logging.DEBUG,
-    handlers=[logging.FileHandler("dt_connections.log"), logging.StreamHandler()],
-)
 logger = logging.getLogger(__name__)
 
 
@@ -28,7 +22,7 @@ class MqttConnection:
         use_mongo=False,
         mongo_url=None,
         mongo_db=None,
-        mongo_collection=False,
+        mongo_collection=None,
     ):
         self.mqtt_loop_run = True
         self.mqtt_client = None
@@ -64,7 +58,6 @@ class MqttConnection:
         self.mongo_client.close()
         return
 
-
     def on_connect(self, client, userdata, flags, reason_code, properties):
         logger.info(f"connected to {self.mqtt_broker_url} at port {self.mqtt_port}.")
         for topic in self.mqtt_topics:
@@ -84,17 +77,14 @@ class MqttConnection:
                 random.choices(string.ascii_uppercase + string.digits, k=10)
             ),
         }
-        logger.debug(
-            f"Received message with seq_id: {data['payload']['seq_id']}"
-        )
+        logger.debug(f"Received message with seq_id: {data['payload']['seq_id']}")
         self.connection_buffer.append(data)
         if self.use_mongo:
             self.mongo_deque.append(data)
 
-
     def run(self):
         self.new_client()
-        logger.debug(f"connecting to {self.mqtt_broker_url} at {self.mqtt_port}.")
+        logger.info(f"connecting to {self.mqtt_broker_url} at {self.mqtt_port}.")
         self.mqtt_client.connect(self.mqtt_broker_url, self.mqtt_port)
         self.mqtt_client.loop_start()
 
@@ -116,4 +106,4 @@ class MqttConnection:
 
     def stop(self):
         self.mqtt_loop_run = False
-        logger.debug(f"stop requested. mqtt_loop_run = {self.mqtt_loop_run}")
+        logger.info(f"stop requested. mqtt_loop_run = {self.mqtt_loop_run}")

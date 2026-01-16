@@ -10,38 +10,50 @@ import time
 import requests
 import json
 import os
+from logging.handlers import RotatingFileHandler
 
-logging.basicConfig(
-    format="%(asctime)s,%(msecs)03d %(name)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    level=logging.DEBUG,
-    handlers=[logging.FileHandler("dt_main.log"), logging.StreamHandler()],
-)
+
+def setup_logging():
+    fmt = logging.Formatter(
+        fmt="%(asctime)s,%(msecs)03d %(name)s %(levelname)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    root = logging.getLogger()
+    root.setLevel(logging.DEBUG)
+
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    sh.setLevel(logging.DEBUG)
+    root.addHandler(sh)
+
+    def file_handler(path: str, level=logging.INFO):
+        fh = RotatingFileHandler(path, maxBytes=10 * 1024 * 1024, backupCount=5)
+        fh.setFormatter(fmt)
+        fh.setLevel(level)
+        return fh
+
+    process_fh = file_handler("dt_process.log", logging.DEBUG)
+    connections_fh = file_handler("dt_connections.log", logging.DEBUG)
+    main_fh = file_handler("dt_main.log", logging.DEBUG)
+
+    log_process = logging.getLogger("process")
+    log_connections = logging.getLogger("connections")
+    log_main = logging.getLogger("__main__")
+
+    log_process.addHandler(process_fh)
+    log_connections.addHandler(connections_fh)
+    log_main.addHandler(main_fh)
+
+    log_process.propagate = True
+    log_connections.propagate = True
+    log_main.propagate = True
+
+    logging.getLogger("pymongo").setLevel(logging.ERROR)
+
+
+setup_logging()
 logger = logging.getLogger(__name__)
-
-# conf_path = "/app/dt/configs/config.yaml"
-conf_path = "./config.yaml"
-confs = yaml.safe_load(open(conf_path))
-process_conf = confs["process"]
-process_buffer_conf = process_conf["buffer"]["size"]
-process_burn_worker = process_conf["burn"]["workers"]
-process_burn_work = process_conf["burn"]["work"]
-
-connection_conf = confs["connections"]
-connection_buffer_conf = connection_conf["buffer"]["size"]
-connection_mqtt_conf = connection_conf["mqtt"]
-connection_mongo_conf = connection_conf["mongodb"]
-connection_use_mongo = connection_mongo_conf["use"]
-if connection_use_mongo:
-    connection_mongo_url = connection_mongo_conf["url"]
-    connection_mongo_db = connection_mongo_conf["database"]
-    connection_mongo_collection = connection_mongo_conf["collection"]
-
-state_max_size = confs["state"]["max_size_mb"]
-
-metrics_file_name = f"{confs['name']}_{confs['metrics']['file_name']}"
-with open(metrics_file_name, "a") as metrics_file:
-    metrics_file.write("Log started.\n")
 
 
 def graceful_shutdown(signum, frame):
@@ -62,6 +74,34 @@ def graceful_shutdown(signum, frame):
 
 
 signal.signal(signal.SIGINT, graceful_shutdown)
+
+# conf_path = "/app/dt/configs/config.yaml"
+conf_path = "./config.yaml"
+confs = yaml.safe_load(open(conf_path))
+process_conf = confs["process"]
+process_buffer_conf = process_conf["buffer"]["size"]
+process_burn_worker = process_conf["burn"]["workers"]
+process_burn_work = process_conf["burn"]["work"]
+
+connection_conf = confs["connections"]
+connection_buffer_conf = connection_conf["buffer"]["size"]
+connection_mqtt_conf = connection_conf["mqtt"]
+connection_mongo_conf = connection_conf["mongodb"]
+connection_use_mongo = connection_mongo_conf["use"]
+connection_mongo_url = None
+connection_mongo_db = None
+connection_mongo_collection = None
+
+if connection_use_mongo:
+    connection_mongo_url = connection_mongo_conf["url"]
+    connection_mongo_db = connection_mongo_conf["database"]
+    connection_mongo_collection = connection_mongo_conf["collection"]
+
+state_max_size = confs["state"]["max_size_mb"]
+
+metrics_file_name = f"{confs['name']}_{confs['metrics']['file_name']}"
+with open(metrics_file_name, "a") as metrics_file:
+    metrics_file.write("Log started.\n")
 
 app = Flask(__name__)
 
@@ -87,7 +127,6 @@ processing = Processing(
     mongo_db=connection_mongo_db,
     mongo_collection=connection_mongo_collection,
 )
-
 
 # check if migrated dt
 source_dt_url_delta = os.environ.get("SOURCE_DT_URL_DELTA")
@@ -125,12 +164,6 @@ if source_dt_url_delta:
         )
 
 startup_mqtt_connection = int(os.environ.get("STARTUP_MQTT_CONNECTION", 1))
-if startup_mqtt_connection != 0:
-    mqtt_t = threading.Thread(target=mqtt_connection.run)
-    mqtt_t.start()
-
-processing_t = threading.Thread(target=processing.run)
-processing_t.start()
 
 
 @app.route("/rebuild", methods=["POST"])
@@ -140,7 +173,7 @@ def rebuild():
         processing.rebuild()
     except:
         return jsonify({"message": "Error in rebuild process."}), 500
-    
+
     rebuild_total_time = time.time() - rebuild_start_time
     return jsonify({"message": f"Rebuild success. Total time: {rebuild_total_time}"})
 
@@ -227,6 +260,13 @@ def process_delta():
 
 if __name__ == "__main__":
     logger.debug("Started main.")
+
+    if startup_mqtt_connection != 0:
+        mqtt_t = threading.Thread(target=mqtt_connection.run)
+        mqtt_t.start()
+
+    processing_t = threading.Thread(target=processing.run)
+    processing_t.start()
 
     with open(metrics_file_name, "a") as metrics_file:
         metrics_file.write(f"Starting service at {time.time()}.\n")

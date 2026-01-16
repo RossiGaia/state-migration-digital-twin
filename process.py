@@ -1,20 +1,13 @@
 from dataclasses import dataclass, asdict
 import time
-import logging
 import json
 import collections
 import threading
-import json
 import queue
 import pymongo
 import sys
+import logging
 
-logging.basicConfig(
-    format="%(asctime)s,%(msecs)03d %(name)s %(levelname)s %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-    level=logging.DEBUG,
-    handlers=[logging.FileHandler("dt_process.log"), logging.StreamHandler()],
-)
 logger = logging.getLogger(__name__)
 
 
@@ -35,6 +28,26 @@ class VirtualizedConveyorPlant:
     wear: float = 5.0
 
 
+@dataclass(frozen=True)
+class ProcessingConfig:
+    pulley_radius_m: float = 0.15
+    rolling_window: int = 50
+
+    # anomaly thresholds
+    vib_high: float = 3.5
+    tension_high: float = 280.0
+    friction_high: float = 0.06
+    temp_rise_overheat: float = 35.0
+    speed_drop: float = 1.0
+    speed_drop_load_min: float = 0.1
+
+    # ODTE params
+    odte_window_length_sec: int = 10
+    odte_desired_timeliness_sec: float = 200.0
+    odte_expected_msg_sec: int = 5
+    odte_refresh_s: float = 0.5
+
+
 class Processing:
     def __init__(
         self,
@@ -48,11 +61,11 @@ class Processing:
         mongo_url=None,
         mongo_db=None,
         mongo_collection=None,
+        config: ProcessingConfig | None = None,
     ):
         self.connection_buffer = connection_buffer
         self.processing_buffer = processing_buffer
         self.observations = collections.deque(maxlen=100)
-        self.messages = collections.deque(maxlen=100)
         self.running = True
         self.conveyor_params = VirtualizedConveyorPlant()
         self.state_max_size = state_max_size
@@ -69,6 +82,7 @@ class Processing:
         self.mongo_url = mongo_url
         self.mongo_db = mongo_db
         self.mongo_collection = mongo_collection
+        self.cfg = config or ProcessingConfig()
 
         if self.use_mongo:
             try:
@@ -88,151 +102,131 @@ class Processing:
         odte_t.start()
 
         while self.running:
-
-            if len(self.connection_buffer) > 0:
-
-                if self.burn_worker > 0 and self.burn_work > 0:
-                    for _ in range(self.burn_worker):
-                        self.burn_queue.put(self.burn_work)
-
-                raw_msg = None
-                try:
-                    message_processing_start = time.time()
-                    raw_msg = self.connection_buffer.popleft()
-                    payload = raw_msg["payload"]
-                    # logger.debug(
-                    #     f"popped from connection_buffer {raw_msg["payload"]["status"]}."
-                    # )
-                except Exception as e:
-                    logger.debug(e)
-                    continue
-
-                status = payload.get("status", {})
-                pt_metrics = self.conveyor_params
-                pt_metrics.name = status.get("name", pt_metrics.name)
-                pt_metrics.load = status.get("load", pt_metrics.load)
-                pt_metrics.angular_acceleration = status.get(
-                    "angular_acceleration", pt_metrics.angular_acceleration
-                )
-                pt_metrics.angular_speed = status.get(
-                    "angular_speed", pt_metrics.angular_speed
-                )
-                pt_metrics.motor_vibration = status.get(
-                    "motor_vibration", pt_metrics.motor_vibration
-                )
-                pt_metrics.belt_tension = status.get(
-                    "belt_tension", pt_metrics.belt_tension
-                )
-                pt_metrics.ambient_temperature = status.get(
-                    "ambient_temperature", pt_metrics.ambient_temperature
-                )
-                pt_metrics.motor_temperature = status.get(
-                    "motor_temperature", pt_metrics.motor_temperature
-                )
-                pt_metrics.belt_friction = status.get(
-                    "belt_friction", pt_metrics.belt_friction
-                )
-                pt_metrics.wear = status.get("wear", pt_metrics.wear)
-
-                snap = asdict(self.conveyor_params)
-
-                snap["recv_timestamp"] = raw_msg["recv_timestamp"]
-                snap["creation_timestamp"] = raw_msg["payload"]["creation_timestamp"]
-                snap["key"] = raw_msg["key"]
-                snap["seq_id"] = self.processing_seq_no
-                self.processing_seq_no += 1
-
-                # Derived metrics (per-sample)
-                # Instantaneous mechanical power proxy: P ≈ T * ω (units: N·m * rad/s = W),
-                # but we don't have shaft torque; approximate with belt_tension and a nominal pulley radius.
-                # If you know the radius, put it in config; use 0.15 m nominal.
-                R_PULLEY = 0.15
-                approx_torque = snap["belt_tension"] * R_PULLEY  # N·m
-                approx_power_w = approx_torque * snap["angular_speed"]  # W
-
-                snap["approx_torque_Nm"] = round(approx_torque, 3)
-                snap["approx_power_W"] = round(approx_power_w, 2)
-                snap["temp_rise_C"] = round(
-                    snap["motor_temperature"] - snap["ambient_temperature"], 3
-                )
-
-                for key in (
-                    "angular_speed",
-                    "motor_vibration",
-                    "belt_tension",
-                    "belt_friction",
-                    "motor_temperature",
-                ):
-                    stats = self._rolling_stats(key)
-                    snap[f"{key}_mean"] = (
-                        None if stats["mean"] is None else round(stats["mean"], 4)
-                    )
-                    snap[f"{key}_slope_per_s"] = (
-                        None
-                        if stats["slope_per_s"] is None
-                        else round(stats["slope_per_s"], 6)
-                    )
-
-                health = self._health_score(snap)
-                snap["health"] = health
-                snap["anomaly"] = {
-                    "vibration_high": (
-                        snap["motor_vibration"] is not None
-                        and snap["motor_vibration"] > 3.5
-                    ),
-                    "tension_high": (
-                        snap["belt_tension"] is not None and snap["belt_tension"] > 280
-                    ),
-                    "friction_high": (
-                        snap["belt_friction"] is not None
-                        and snap["belt_friction"] > 0.06
-                    ),
-                    "temp_overheat": (
-                        snap["temp_rise_C"] is not None and snap["temp_rise_C"] > 35.0
-                    ),
-                    "speed_drop": (
-                        snap["angular_speed"] is not None
-                        and snap["angular_speed"] < 1.0
-                        and snap["load"] > 0.1
-                    ),
-                }
-
-                snap_size = len(json.dumps(snap).encode("utf-8"))
-
-                if self.state_max_size:
-                    snap["padding"] = self.generate_padding(
-                        self.state_max_size, snap_size
-                    )
-
-                snap["processed_timestamp"] = time.time() - message_processing_start
-                self.processing_buffer.append(snap)
-
-                observation_obj = {
-                    "key": snap["key"],
-                    "received_timestamp": snap["recv_timestamp"],
-                    "creation_timestamp": snap["creation_timestamp"],
-                    "execution_timestamp": snap["processed_timestamp"],
-                    "obs_value": snap["recv_timestamp"]
-                    - snap["creation_timestamp"]
-                    + snap["processed_timestamp"],
-                }
-                self.observations.append(observation_obj)
-
-                # logger.debug(
-                #     f"Buffers size in MB:\n\tconnection_buffer: {len(json.dumps(list(self.connection_buffer)).encode('utf-8')) / 1024 / 1024}\n\tprocessing_buffer: {len(json.dumps(list(self.processing_buffer)).encode('utf-8')) / 1024 / 1024} with {len(self.processing_buffer)} number of elements"
-                # )
-
-                if self.burn_worker > 0 and self.burn_work > 0:
-                    self.burn_queue.join()
-
-                # logger.debug(json.dumps(snap, indent=4))
-                logger.info(
-                    f"time to elaborate the message: {time.time() - snap['processed_timestamp']}"
-                )
-            else:
+            if len(self.connection_buffer) <= 0:
                 time.sleep(0.001)
+                continue
 
-    def generate_padding(self, max_size, current_size):
+            if self.burn_worker > 0 and self.burn_work > 0:
+                for _ in range(self.burn_worker):
+                    self.burn_queue.put(self.burn_work)
+
+            t0 = time.time()
+            try:
+                raw_msg = self.connection_buffer.popleft()
+            except Exception as e:
+                logger.debug(e)
+                continue
+
+            snap = self._build_snap(raw_msg)
+            self._add_derived_metrics(snap)
+            self._add_rolling_features(snap)
+            self._add_health_and_anomalies(snap)
+            self._maybe_pad(snap)
+
+            processing_time = time.time() - t0
+            snap["processing_time_s"] = processing_time
+
+            self.processing_buffer.append(snap)
+            self._record_observation(snap, processing_time)
+
+            if self.burn_worker > 0 and self.burn_work > 0:
+                self.burn_queue.join()
+
+            logger.info(f"time to elaborate the message: {processing_time}")
+
+    def _build_snap(self, raw_msg: dict) -> dict:
+        payload = raw_msg["payload"]
+        status = payload.get("status", {})
+
+        pt = self.conveyor_params
+        pt.name = status.get("name", pt.name)
+        pt.load = status.get("load", pt.load)
+        pt.angular_acceleration = status.get(
+            "angular_acceleration", pt.angular_acceleration
+        )
+        pt.angular_speed = status.get("angular_speed", pt.angular_speed)
+        pt.motor_vibration = status.get("motor_vibration", pt.motor_vibration)
+        pt.belt_tension = status.get("belt_tension", pt.belt_tension)
+        pt.ambient_temperature = status.get(
+            "ambient_temperature", pt.ambient_temperature
+        )
+        pt.motor_temperature = status.get("motor_temperature", pt.motor_temperature)
+        pt.belt_friction = status.get("belt_friction", pt.belt_friction)
+        pt.wear = status.get("wear", pt.wear)
+
+        snap = asdict(pt)
+        snap["recv_timestamp"] = raw_msg["recv_timestamp"]
+        snap["creation_timestamp"] = payload["creation_timestamp"]
+        snap["key"] = raw_msg["key"]
+        snap["seq_id"] = self.processing_seq_no
+        self.processing_seq_no += 1
+        return snap
+
+    def _add_derived_metrics(self, snap: dict) -> None:
+        R = self.cfg.pulley_radius_m
+        approx_torque = snap["belt_tension"] * R
+        approx_power_w = approx_torque * snap["angular_speed"]
+
+        snap["approx_torque_Nm"] = round(approx_torque, 3)
+        snap["approx_power_W"] = round(approx_power_w, 2)
+        snap["temp_rise_C"] = round(
+            snap["motor_temperature"] - snap["ambient_temperature"], 3
+        )
+
+    def _add_rolling_features(self, snap: dict) -> None:
+        for key in (
+            "angular_speed",
+            "motor_vibration",
+            "belt_tension",
+            "belt_friction",
+            "motor_temperature",
+        ):
+            stats = self._rolling_stats(key, window=self.cfg.rolling_window)
+            snap[f"{key}_mean"] = (
+                None if stats["mean"] is None else round(stats["mean"], 4)
+            )
+            snap[f"{key}_slope_per_s"] = (
+                None if stats["slope_per_s"] is None else round(stats["slope_per_s"], 6)
+            )
+
+    def _add_health_and_anomalies(self, snap: dict) -> None:
+        snap["health"] = self._health_score(snap)
+
+        snap["anomaly"] = {
+            "vibration_high": snap.get("motor_vibration") is not None
+            and snap["motor_vibration"] > self.cfg.vib_high,
+            "tension_high": snap.get("belt_tension") is not None
+            and snap["belt_tension"] > self.cfg.tension_high,
+            "friction_high": snap.get("belt_friction") is not None
+            and snap["belt_friction"] > self.cfg.friction_high,
+            "temp_overheat": snap.get("temp_rise_C") is not None
+            and snap["temp_rise_C"] > self.cfg.temp_rise_overheat,
+            "speed_drop": (
+                snap.get("angular_speed") is not None
+                and snap["angular_speed"] < self.cfg.speed_drop
+                and snap.get("load", 0.0) > self.cfg.speed_drop_load_min
+            ),
+        }
+
+    def _maybe_pad(self, snap: dict) -> None:
+        if not self.state_max_size:
+            return
+        snap_size = len(json.dumps(snap).encode("utf-8"))
+        snap["padding"] = self._generate_padding(self.state_max_size, snap_size)
+
+    def _record_observation(self, snap: dict, processing_time: float) -> None:
+        self.observations.append(
+            {
+                "key": snap["key"],
+                "received_timestamp": snap["recv_timestamp"],
+                "creation_timestamp": snap["creation_timestamp"],
+                "execution_time_s": processing_time,
+                "obs_value": (snap["recv_timestamp"] - snap["creation_timestamp"])
+                + processing_time,
+            }
+        )
+
+    def _generate_padding(self, max_size, current_size):
         buffer_max_length = self.processing_buffer.maxlen
         padding_length = (
             round(max_size * 1024 * 1024 / buffer_max_length) - current_size
@@ -243,7 +237,7 @@ class Processing:
         else:
             return None
 
-    def compute_timeliness(self, desired_timeliness_sec: float):
+    def _compute_timeliness(self, desired_timeliness_sec: float):
         obs_list = list(self.observations)
 
         if len(obs_list) == 0:
@@ -258,7 +252,7 @@ class Processing:
 
         return percentile
 
-    def compute_reliability(self, window_length_sec: int, expected_msg_sec: int):
+    def _compute_reliability(self, window_length_sec: int, expected_msg_sec: int):
         end_window_time = time.time()
         start_window_time = time.time() - window_length_sec
 
@@ -277,15 +271,15 @@ class Processing:
 
         return float(count / expected_msg_tot)
 
-    def compute_availability(self):
+    def _compute_availability(self):
         return 1.0
 
-    def compute_odte_phytodig(
+    def _compute_odte_phytodig(
         self, window_length_sec, desired_timeliness_sec, expected_msg_sec
     ):
-        timeliness = self.compute_timeliness(desired_timeliness_sec)
-        reliability = self.compute_reliability(window_length_sec, expected_msg_sec)
-        availability = self.compute_availability()
+        timeliness = self._compute_timeliness(desired_timeliness_sec)
+        reliability = self._compute_reliability(window_length_sec, expected_msg_sec)
+        availability = self._compute_availability()
 
         logger.debug(
             f"Availability: {availability}\tReliability: {reliability}\tTimeliness: {timeliness}"
@@ -307,31 +301,35 @@ class Processing:
         except (TypeError, ValueError):
             return float(default)
 
-    def _rolling_stats(self, key):
-        """Rolling mean + slope over a recent window (optional)."""
+    def _rolling_stats(self, key: str, window: int = 50):
         buf = self.processing_buffer
         if not buf:
             return {"mean": None, "slope_per_s": None}
 
-        window = len(buf)
+        rows = list(buf)[-window:]
+        pairs = []
+        for r in rows:
+            y = r.get(key)
+            t = r.get("recv_timestamp")
+            if y is None or t is None:
+                continue
+            pairs.append((t, y))
 
-        xs = list(buf)[-window:]
-        ys = [row.get(key) for row in xs if row.get(key) is not None]
-        ts = [row["recv_timestamp"] for row in xs if row.get(key) is not None]
-        if len(ys) < 2:
-            return {"mean": sum(ys) / len(ys) if ys else None, "slope_per_s": None}
+        if not pairs:
+            return {"mean": None, "slope_per_s": None}
+        if len(pairs) == 1:
+            return {"mean": float(pairs[0][1]), "slope_per_s": None}
 
+        ts, ys = zip(*pairs)
         mean = sum(ys) / len(ys)
 
-        # simple linear regression slope (y vs t)
         t0 = ts[0]
         xt = [t - t0 for t in ts]
         xbar = sum(xt) / len(xt)
         ybar = mean
         num = sum((xt[i] - xbar) * (ys[i] - ybar) for i in range(len(ys)))
         den = sum((xt[i] - xbar) ** 2 for i in range(len(ys))) or 1.0
-        slope = num / den
-        return {"mean": mean, "slope_per_s": slope}
+        return {"mean": mean, "slope_per_s": num / den}
 
     def _health_score(self, row):
         """
@@ -405,38 +403,47 @@ class Processing:
         return 0
 
     def rebuild(self):
+        t0 = time.time()
         logger.debug(f"Use mongo is {self.use_mongo}")
         if not self.use_mongo:
             return
 
-        client = pymongo.MongoClient(self.mongo_url)
-        coll = client[self.mongo_db][self.mongo_collection]
+        coll = self.mongo_client[self.mongo_db][self.mongo_collection]
 
-        cursor = coll.find({}).sort("payload.seq_id", 1) 
+        cursor = coll.find({}).sort("payload.seq_id", 1)
         events = list(cursor)
-        logger.debug(f"Documents retrived:\n{events}")
+        # logger.debug(f"Documents retrived:\n{events}")
 
         rebuilt = collections.deque(maxlen=self.connection_buffer.maxlen)
 
         for doc in events:
             if "payload" not in doc:
                 continue
-            rebuilt.append({
-                "payload": doc["payload"],
-                "recv_timestamp": doc.get("recv_timestamp", time.time()),
-                "key": doc.get("key", str(doc.get("_id")))
-            })
+            rebuilt.append(
+                {
+                    "payload": doc["payload"],
+                    "recv_timestamp": doc.get("recv_timestamp", time.time()),
+                    "key": doc.get("key", str(doc.get("_id"))),
+                }
+            )
 
         with self.lock:
             self.connection_buffer = rebuilt
 
+        mongo_docs_retrival_time = time.time() - t0
+        logger.info(f"Time to retrieve mongo docs {mongo_docs_retrival_time}.")
+
     def odte_computation(self):
         while self.running:
-            new_odte = self.compute_odte_phytodig(10, 200, 5)
+            new_odte = self._compute_odte_phytodig(
+                self.cfg.odte_window_length_sec,
+                self.cfg.odte_desired_timeliness_sec,
+                self.cfg.odte_expected_msg_sec,
+            )
             with self.lock:
                 self.odte = new_odte
 
-            time.sleep(0.5)
+            time.sleep(self.cfg.odte_refresh_s)
 
     def get_odte(self):
         with self.lock:
@@ -506,12 +513,14 @@ class Processing:
                     setattr(self.conveyor_params, key, value)
 
             new_conn_buffer = different_items["connection_buffer"]
-            self.connection_buffer.append(new_conn_buffer)
+            self.connection_buffer = collections.deque(
+                new_conn_buffer, maxlen=self.connection_buffer.maxlen
+            )
 
             new_proc_buffer = different_items["processing_buffer"]
             self.processing_buffer.extend(new_proc_buffer)
 
-    def compute_prime_numbers(self, max_n: int):
+    def _burn_cpu_primes(self, max_n: int):
         for i in range(3, max_n + 1):
             is_prime = True
             for j in range(2, int(i**0.5) + 1):
@@ -525,5 +534,5 @@ class Processing:
             if work is None:
                 self.burn_queue.task_done()
                 break
-            self.compute_prime_numbers(work)
+            self._burn_cpu_primes(work)
             self.burn_queue.task_done()
