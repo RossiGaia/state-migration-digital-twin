@@ -102,19 +102,19 @@ class Processing:
         odte_t.start()
 
         while self.running:
-            if len(self.connection_buffer) <= 0:
-                time.sleep(0.001)
-                continue
-
             if self.burn_worker > 0 and self.burn_work > 0:
                 for _ in range(self.burn_worker):
                     self.burn_queue.put(self.burn_work)
 
             t0 = time.time()
-            try:
-                raw_msg = self.connection_buffer.popleft()
-            except Exception as e:
-                logger.debug(e)
+            with self.lock:
+                if not self.connection_buffer:
+                    raw_msg = None
+                else:
+                    raw_msg = self.connection_buffer.popleft()
+
+            if raw_msg is None:
+                time.sleep(0.001)
                 continue
 
             snap = self._build_snap(raw_msg)
@@ -126,8 +126,9 @@ class Processing:
             processing_time = time.time() - t0
             snap["processing_time_s"] = processing_time
 
-            self.processing_buffer.append(snap)
-            self._record_observation(snap, processing_time)
+            with self.lock:
+                self.processing_buffer.append(snap)
+                self._record_observation(snap, processing_time)
 
             if self.burn_worker > 0 and self.burn_work > 0:
                 self.burn_queue.join()
@@ -138,23 +139,25 @@ class Processing:
         payload = raw_msg["payload"]
         status = payload.get("status", {})
 
-        pt = self.conveyor_params
-        pt.name = status.get("name", pt.name)
-        pt.load = status.get("load", pt.load)
-        pt.angular_acceleration = status.get(
-            "angular_acceleration", pt.angular_acceleration
-        )
-        pt.angular_speed = status.get("angular_speed", pt.angular_speed)
-        pt.motor_vibration = status.get("motor_vibration", pt.motor_vibration)
-        pt.belt_tension = status.get("belt_tension", pt.belt_tension)
-        pt.ambient_temperature = status.get(
-            "ambient_temperature", pt.ambient_temperature
-        )
-        pt.motor_temperature = status.get("motor_temperature", pt.motor_temperature)
-        pt.belt_friction = status.get("belt_friction", pt.belt_friction)
-        pt.wear = status.get("wear", pt.wear)
+        with self.lock:
+            pt = self.conveyor_params
+            pt.name = status.get("name", pt.name)
+            pt.load = status.get("load", pt.load)
+            pt.angular_acceleration = status.get(
+                "angular_acceleration", pt.angular_acceleration
+            )
+            pt.angular_speed = status.get("angular_speed", pt.angular_speed)
+            pt.motor_vibration = status.get("motor_vibration", pt.motor_vibration)
+            pt.belt_tension = status.get("belt_tension", pt.belt_tension)
+            pt.ambient_temperature = status.get(
+                "ambient_temperature", pt.ambient_temperature
+            )
+            pt.motor_temperature = status.get("motor_temperature", pt.motor_temperature)
+            pt.belt_friction = status.get("belt_friction", pt.belt_friction)
+            pt.wear = status.get("wear", pt.wear)
 
-        snap = asdict(pt)
+            snap = asdict(pt)
+
         snap["recv_timestamp"] = raw_msg["recv_timestamp"]
         snap["creation_timestamp"] = payload["creation_timestamp"]
         snap["key"] = raw_msg["key"]
@@ -238,7 +241,8 @@ class Processing:
             return None
 
     def _compute_timeliness(self, desired_timeliness_sec: float):
-        obs_list = list(self.observations)
+        with self.lock:
+            obs_list = list(self.observations)
 
         if len(obs_list) == 0:
             return 0.0
@@ -256,7 +260,8 @@ class Processing:
         end_window_time = time.time()
         start_window_time = time.time() - window_length_sec
 
-        msg_list = list(self.processing_buffer)
+        with self.lock:
+            msg_list = list(self.processing_buffer)
         msg_required = msg_list[-window_length_sec * expected_msg_sec :]
 
         count = 0
@@ -302,11 +307,12 @@ class Processing:
             return float(default)
 
     def _rolling_stats(self, key: str, window: int = 50):
-        buf = self.processing_buffer
-        if not buf:
-            return {"mean": None, "slope_per_s": None}
+        with self.lock:
+            if not self.processing_buffer:
+                return {"mean": None, "slope_per_s": None}
 
-        rows = list(buf)[-window:]
+            rows = list(self.processing_buffer)[-window:]
+            
         pairs = []
         for r in rows:
             y = r.get(key)
@@ -497,8 +503,9 @@ class Processing:
         if prev_state_max_size != current_state["state_max_size"]:
             different_items["state_max_size"] = current_state["state_max_size"]
 
-        self.transmitted_state = current_state
-        self.last_transmitted_processing_seq_no = max_seq_seen
+        with self.lock:
+            self.transmitted_state = current_state
+            self.last_transmitted_processing_seq_no = max_seq_seen
 
         return different_items
 
