@@ -7,6 +7,11 @@ connections:
     topics:
     - "test/#"
     - "control"
+  mongodb:
+    use: yes
+    url: "mongodb://localhost:27017"
+    database: "pt"
+    collection: "events"
 
   buffer:
     size: 100

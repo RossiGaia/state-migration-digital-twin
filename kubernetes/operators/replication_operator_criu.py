@@ -3,6 +3,7 @@ from kubernetes import client
 from kubernetes.utils import create_from_dict
 from k8s_utils import delete_from_dict
 import os
+import time
 
 @kopf.on.create("cyberphysicalapplications")
 def create_fn(spec, name, namespace, meta, logger, **kwargs):
@@ -208,6 +209,16 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
     current_container_name = resp.items[0].spec.containers[0].name
     host_ip = resp.items[0].status.host_ip
 
+    # disconnect dt from mqtt
+    cluster_ip = "10.16.11.142"
+    port = "30000"
+    disconnect_url = f"http://{cluster_ip}:{port}/disconnect"
+    resp = requests.post(disconnect_url)
+    if resp.status_code != 200:
+        logger.error(f"Error in mqtt disconnection.")
+        return
+    
+    logger.debug(f"Mqtt disconnected")
 
     # call the checkpoint api
     checkpoint_url = f"http://{host_ip}:9000/checkpoint"
@@ -327,5 +338,14 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
 
     operation_end_time = datetime.datetime.now()
     timestamps.append([operation_name, operation_start_time, operation_end_time])
+
+    time.sleep(2)
+
+    # restart the mqtt client on the dt
+    reconnect_url = f"http://{cluster_ip}:{port}/reconnect"
+    resp = requests.post(reconnect_url)
+    if resp.status_code != 200:
+        logger.error(f"Error in mqtt reconnnection.")
+        return
 
     return

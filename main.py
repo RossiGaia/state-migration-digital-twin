@@ -30,6 +30,12 @@ process_burn_work = process_conf["burn"]["work"]
 connection_conf = confs["connections"]
 connection_buffer_conf = connection_conf["buffer"]["size"]
 connection_mqtt_conf = connection_conf["mqtt"]
+connection_mongo_conf = connection_conf["mongodb"]
+connection_use_mongo = connection_mongo_conf["use"]
+if connection_use_mongo:
+    connection_mongo_url = connection_mongo_conf["url"]
+    connection_mongo_db = connection_mongo_conf["database"]
+    connection_mongo_collection = connection_mongo_conf["collection"]
 
 state_max_size = confs["state"]["max_size_mb"]
 
@@ -63,7 +69,12 @@ processing_buffer = collections.deque(maxlen=process_buffer_conf)
 connection_buffer = collections.deque(maxlen=connection_buffer_conf)
 
 mqtt_connection = MqttConnection(
-    connection_buffer=connection_buffer, mqtt_conf=connection_mqtt_conf
+    connection_buffer=connection_buffer,
+    mqtt_conf=connection_mqtt_conf,
+    use_mongo=connection_use_mongo,
+    mongo_url=connection_mongo_url,
+    mongo_db=connection_mongo_db,
+    mongo_collection=connection_mongo_collection,
 )
 processing = Processing(
     connection_buffer=connection_buffer,
@@ -71,12 +82,17 @@ processing = Processing(
     state_max_size=state_max_size,
     worker=process_burn_worker,
     work=process_burn_work,
+    use_mongo=connection_use_mongo,
+    mongo_url=connection_mongo_url,
+    mongo_db=connection_mongo_db,
+    mongo_collection=connection_mongo_collection,
 )
 
 
 # check if migrated dt
 source_dt_url_delta = os.environ.get("SOURCE_DT_URL_DELTA")
 source_dt_url_disconnect = os.environ.get("SOURCE_DT_URL_DISCONNECT")
+
 if source_dt_url_delta:
 
     restore_start_timestamp = time.time()
@@ -108,11 +124,26 @@ if source_dt_url_delta:
             f"Restoring total time: {restore_end_timestamp - restore_start_timestamp}. Started at {restore_start_timestamp}, ended at {restore_end_timestamp}.\n"
         )
 
-mqtt_t = threading.Thread(target=mqtt_connection.run)
-mqtt_t.start()
+startup_mqtt_connection = int(os.environ.get("STARTUP_MQTT_CONNECTION", 1))
+if startup_mqtt_connection != 0:
+    mqtt_t = threading.Thread(target=mqtt_connection.run)
+    mqtt_t.start()
 
 processing_t = threading.Thread(target=processing.run)
 processing_t.start()
+
+
+@app.route("/rebuild", methods=["POST"])
+def rebuild():
+    rebuild_start_time = time.time()
+    try:
+        processing.rebuild()
+    except:
+        return jsonify({"message": "Error in rebuild process."}), 500
+    
+    rebuild_total_time = time.time() - rebuild_start_time
+    return jsonify({"message": f"Rebuild success. Total time: {rebuild_total_time}"})
+
 
 @app.route("/state", methods=["GET"])
 def get_state():
@@ -142,6 +173,7 @@ def set_state():
     else:
         return jsonify({"status": "error"})
 
+
 @app.route("/disconnect", methods=["POST"])
 def disconnect():
     try:
@@ -149,8 +181,9 @@ def disconnect():
         mqtt_t.join()
     except:
         return jsonify({"status": "error"})
-    
+
     return jsonify({"status": "success"})
+
 
 @app.route("/reconnect", methods=["POST"])
 def reconnect():
@@ -161,8 +194,9 @@ def reconnect():
         mqtt_t.start()
     except:
         return jsonify({"status": "error"})
-    
+
     return jsonify({"status": "success"})
+
 
 @app.route("/healthd")
 def health_check():

@@ -6,6 +6,8 @@ import collections
 import threading
 import json
 import queue
+import pymongo
+import sys
 
 logging.basicConfig(
     format="%(asctime)s,%(msecs)03d %(name)s %(levelname)s %(message)s",
@@ -42,6 +44,10 @@ class Processing:
         state_max_size=None,
         worker=0,
         work=0,
+        use_mongo=False,
+        mongo_url=None,
+        mongo_db=None,
+        mongo_collection=None,
     ):
         self.connection_buffer = connection_buffer
         self.processing_buffer = processing_buffer
@@ -59,6 +65,17 @@ class Processing:
         self.burn_threads = []
         self.processing_seq_no = 0
         self.last_transmitted_processing_seq_no = -1
+        self.use_mongo = use_mongo
+        self.mongo_url = mongo_url
+        self.mongo_db = mongo_db
+        self.mongo_collection = mongo_collection
+
+        if self.use_mongo:
+            try:
+                self.mongo_client = pymongo.MongoClient(self.mongo_url)
+            except:
+                logger.error("Could not connect to mongo.")
+                sys.exit(1)
 
         if self.burn_worker > 0 and self.burn_work > 0:
             for i in range(self.burn_worker):
@@ -388,7 +405,30 @@ class Processing:
         return 0
 
     def rebuild(self):
-        raise NotImplementedError
+        logger.debug(f"Use mongo is {self.use_mongo}")
+        if not self.use_mongo:
+            return
+
+        client = pymongo.MongoClient(self.mongo_url)
+        coll = client[self.mongo_db][self.mongo_collection]
+
+        cursor = coll.find({}).sort("payload.seq_id", 1) 
+        events = list(cursor)
+        logger.debug(f"Documents retrived:\n{events}")
+
+        rebuilt = collections.deque(maxlen=self.connection_buffer.maxlen)
+
+        for doc in events:
+            if "payload" not in doc:
+                continue
+            rebuilt.append({
+                "payload": doc["payload"],
+                "recv_timestamp": doc.get("recv_timestamp", time.time()),
+                "key": doc.get("key", str(doc.get("_id")))
+            })
+
+        with self.lock:
+            self.connection_buffer = rebuilt
 
     def odte_computation(self):
         while self.running:
