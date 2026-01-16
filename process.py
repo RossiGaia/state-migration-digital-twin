@@ -62,6 +62,9 @@ class Processing:
         mongo_db=None,
         mongo_collection=None,
         config: ProcessingConfig | None = None,
+        do_periodic_dumps=False,
+        periodic_dumps_interval=0,
+        periodic_dumps_file_path=None,
     ):
         self.connection_buffer = connection_buffer
         self.processing_buffer = processing_buffer
@@ -83,6 +86,10 @@ class Processing:
         self.mongo_db = mongo_db
         self.mongo_collection = mongo_collection
         self.cfg = config or ProcessingConfig()
+        self.do_periodic_dumps = do_periodic_dumps
+        self.periodic_dumps_interval = periodic_dumps_interval
+        self.periodic_dumps_file_path = periodic_dumps_file_path
+        self.odte_t = threading.Thread(target=self.odte_computation, daemon=True)
 
         if self.use_mongo:
             try:
@@ -91,6 +98,9 @@ class Processing:
                 logger.error("Could not connect to mongo.")
                 sys.exit(1)
 
+        if self.do_periodic_dumps:
+            self.periodic_dumps_t = threading.Thread(target=self.periodic_dump, daemon=True)
+
         if self.burn_worker > 0 and self.burn_work > 0:
             for i in range(self.burn_worker):
                 t = threading.Thread(target=self.burn_worker_loop, daemon=True)
@@ -98,8 +108,10 @@ class Processing:
                 self.burn_threads.append(t)
 
     def run(self):
-        odte_t = threading.Thread(target=self.odte_computation, daemon=True)
-        odte_t.start()
+        
+        if self.do_periodic_dumps:
+            self.periodic_dumps_t.start()
+        self.odte_t.start()
 
         while self.running:
             if self.burn_worker > 0 and self.burn_work > 0:
@@ -312,7 +324,7 @@ class Processing:
                 return {"mean": None, "slope_per_s": None}
 
             rows = list(self.processing_buffer)[-window:]
-            
+
         pairs = []
         for r in rows:
             y = r.get(key)
@@ -526,6 +538,15 @@ class Processing:
 
             new_proc_buffer = different_items["processing_buffer"]
             self.processing_buffer.extend(new_proc_buffer)
+
+    def periodic_dump(self):
+        if not self.do_periodic_dumps:
+            return
+        
+        while self.running:
+            with open(self.periodic_dumps_file_path, "w") as file:
+                file.writelines(json.dumps(self.serialize_state()))
+            time.sleep(self.periodic_dumps_interval)
 
     def _burn_cpu_primes(self, max_n: int):
         for i in range(3, max_n + 1):

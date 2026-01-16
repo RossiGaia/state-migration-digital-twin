@@ -82,6 +82,9 @@ process_conf = confs["process"]
 process_buffer_conf = process_conf["buffer"]["size"]
 process_burn_worker = process_conf["burn"]["workers"]
 process_burn_work = process_conf["burn"]["work"]
+process_do_periodic_checkpoints = process_conf["file_checkpoints"]["use"]
+process_periodic_checkpoints_interval = process_conf["file_checkpoints"]["interval"]
+process_periodic_checkpoints_file = process_conf["file_checkpoints"]["path"]
 
 connection_conf = confs["connections"]
 connection_buffer_conf = connection_conf["buffer"]["size"]
@@ -126,9 +129,13 @@ processing = Processing(
     mongo_url=connection_mongo_url,
     mongo_db=connection_mongo_db,
     mongo_collection=connection_mongo_collection,
+    do_periodic_dumps=process_do_periodic_checkpoints,
+    periodic_dumps_interval=process_periodic_checkpoints_interval,
+    periodic_dumps_file_path=process_periodic_checkpoints_file
 )
 
 # check if migrated dt
+# live replication
 source_dt_url_delta = os.environ.get("SOURCE_DT_URL_DELTA")
 source_dt_url_disconnect = os.environ.get("SOURCE_DT_URL_DISCONNECT")
 
@@ -164,6 +171,16 @@ if source_dt_url_delta:
         )
 
 startup_mqtt_connection = int(os.environ.get("STARTUP_MQTT_CONNECTION", 1))
+
+# storage rebinding
+# serialization file the same of config file
+serialize_from_file = bool(os.environ.get("DT_SERIALIZE_FROM_FILE", False))
+if serialize_from_file:
+    with open(process_periodic_checkpoints_file, "r") as file:
+        lines = file.readlines()
+
+    serialized_state = json.loads(''.join(lines))
+    processing.deserialize_state(serialized_state)
 
 
 @app.route("/rebuild", methods=["POST"])
