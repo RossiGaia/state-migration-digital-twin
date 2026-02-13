@@ -202,18 +202,7 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
     next_deployment_configs = next_deployment.get("configs")
     next_deployment_affinity = next_deployment.get("affinity")
 
-    # start the new instance with env vars so it knows it is migrated
-    label_selector = "debug=current-service"
-    resp = k8s_core_v1.list_namespaced_service(
-        current_deployment_namespace, label_selector=label_selector
-    )
-    current_deployment_service_name = resp.items[0].metadata.name
-    current_deployment_service_namespace = resp.items[0].metadata.namespace
-    current_deployment_service_port = resp.items[0].spec.ports[0].target_port
-
-    SOURCE_DT_URL_DELTA = f"http://{current_deployment_service_name}.{current_deployment_service_namespace}.svc.cluster.local:{current_deployment_service_port}/delta"
-    SOURCE_DT_URL_DISCONNECT = f"http://{current_deployment_service_name}.{current_deployment_service_namespace}.svc.cluster.local:{current_deployment_service_port}/disconnect"
-
+    # start the new instance 
     annotations_patch = {"metadata": {"annotations": dict(meta.annotations)}}
     for config in next_deployment_configs:
         if config.get("kind") == "Deployment":
@@ -241,22 +230,6 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
                 "child-deployment-affinity"
             ] = next_deployment_affinity
 
-            if "env" in config["spec"]["template"]["spec"]["containers"][0]:
-                config["spec"]["template"]["spec"]["containers"][0]["env"].append(
-                    {"name": "SOURCE_DT_URL_DELTA", "value": SOURCE_DT_URL_DELTA}
-                )
-            else:
-                config["spec"]["template"]["spec"]["containers"][0]["env"] = [
-                    {
-                        "name": "SOURCE_DT_URL_DELTA",
-                        "value": SOURCE_DT_URL_DELTA,
-                    }
-                ]
-
-            config["spec"]["template"]["spec"]["containers"][0]["env"].append(
-                {"name": "SOURCE_DT_URL_DISCONNECT", "value": SOURCE_DT_URL_DISCONNECT}
-            )
-
         if config.get("kind") == "Service":
             next_deployment_service_name = config.get("metadata").get("name")
             next_deployment_service = config
@@ -277,29 +250,14 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
     operation_end_time = datetime.datetime.now()
     timestamps.append([operation_name, operation_start_time, operation_end_time])
 
-    # need to wait the new instance to do the migration
-    resp = k8s_core_v1.read_namespaced_service(
-        next_deployment_service_name, next_deployment_namespace
-    )
-    next_deployment_service_port = resp.spec.ports[0].node_port
-    control_plane_ip = "10.16.11.142"
-    target_dt_migration_done_url = (
-        f"http://{control_plane_ip}:{next_deployment_service_port}/migration_status"
-    )
+    # need to wait to rebuild the state
+    mirror_time = float(spec["mirrorTime"])
 
-    max_retries = 10
-    retries = 0
-    resp = None
-    while not resp or resp.json()["status"] != True:
-        if retries == max_retries:
-            logger.error("Hit max retries, returning.")
-            return
-        try:
-            resp = requests.get(url=target_dt_migration_done_url)
-        except requests.exceptions.ConnectionError:
-            logger.info("Cannot connect to target dt.")
-            retries += 1
-            time.sleep(2.0)
+    print(f"Waiting {mirror_time} second before deleting old instance")
+
+    time.sleep(mirror_time)
+
+    print(f"Deleting old instance.")
 
     operation_name = "Deleting old instance"
     operation_start_time = operation_end_time

@@ -145,7 +145,7 @@ class Processing:
             if self.burn_worker > 0 and self.burn_work > 0:
                 self.burn_queue.join()
 
-            logger.info(f"time to elaborate the message: {processing_time}")
+            logger.debug(f"time to elaborate the message: {processing_time}")
 
     def _build_snap(self, raw_msg: dict) -> dict:
         payload = raw_msg["payload"]
@@ -532,9 +532,7 @@ class Processing:
                     setattr(self.conveyor_params, key, value)
 
             new_conn_buffer = different_items["connection_buffer"]
-            self.connection_buffer = collections.deque(
-                new_conn_buffer, maxlen=self.connection_buffer.maxlen
-            )
+            self.connection_buffer.extend(new_conn_buffer)
 
             new_proc_buffer = different_items["processing_buffer"]
             self.processing_buffer.extend(new_proc_buffer)

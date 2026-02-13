@@ -181,13 +181,6 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
     k8s_core_v1 = client.CoreV1Api()
     k8s_custom_object = client.CustomObjectsApi()
 
-    # trigger a migration
-    timestamps = []
-
-    operation_name = "Creating new instance"
-    operation_start_time = datetime.datetime.now()
-
-    # create new instance
     deployments = spec.get("deployments")
     current_deployment_affinity = meta.get("annotations").get(
         "child-deployment-affinity"
@@ -202,18 +195,28 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
     next_deployment_configs = next_deployment.get("configs")
     next_deployment_affinity = next_deployment.get("affinity")
 
-    # start the new instance with env vars so it knows it is migrated
-    label_selector = "debug=current-service"
-    resp = k8s_core_v1.list_namespaced_service(
-        current_deployment_namespace, label_selector=label_selector
-    )
-    current_deployment_service_name = resp.items[0].metadata.name
-    current_deployment_service_namespace = resp.items[0].metadata.namespace
-    current_deployment_service_port = resp.items[0].spec.ports[0].target_port
+    # trigger a migration
+    timestamps = []
 
-    SOURCE_DT_URL_DELTA = f"http://{current_deployment_service_name}.{current_deployment_service_namespace}.svc.cluster.local:{current_deployment_service_port}/delta"
-    SOURCE_DT_URL_DISCONNECT = f"http://{current_deployment_service_name}.{current_deployment_service_namespace}.svc.cluster.local:{current_deployment_service_port}/disconnect"
+    print(f"Deleting old instance.")
 
+    operation_name = "Deleting old instance"
+    operation_start_time = datetime.datetime.now()
+
+    # delete old instance
+    for depl in deployments:
+        if depl.get("affinity") == current_deployment_affinity:
+            for config in depl.get("configs"):
+                delete_from_dict(k8s_client, config)
+
+    ensure_pod_termination(k8s_core_v1, current_deployment_app_name, namespace, logger)
+    operation_end_time = datetime.datetime.now()
+    timestamps.append([operation_name, operation_start_time, operation_end_time])
+
+    operation_name = "Creating new instance"
+    operation_start_time = operation_end_time
+
+    # start the new instance 
     annotations_patch = {"metadata": {"annotations": dict(meta.annotations)}}
     for config in next_deployment_configs:
         if config.get("kind") == "Deployment":
@@ -241,21 +244,18 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
                 "child-deployment-affinity"
             ] = next_deployment_affinity
 
+            # start the instance without mqtt connection
             if "env" in config["spec"]["template"]["spec"]["containers"][0]:
                 config["spec"]["template"]["spec"]["containers"][0]["env"].append(
-                    {"name": "SOURCE_DT_URL_DELTA", "value": SOURCE_DT_URL_DELTA}
+                    {"name": "STARTUP_MQTT_CONNECTION", "value": "0"}
                 )
             else:
                 config["spec"]["template"]["spec"]["containers"][0]["env"] = [
                     {
-                        "name": "SOURCE_DT_URL_DELTA",
-                        "value": SOURCE_DT_URL_DELTA,
+                        "name": "STARTUP_MQTT_CONNECTION",
+                        "value": "0",
                     }
                 ]
-
-            config["spec"]["template"]["spec"]["containers"][0]["env"].append(
-                {"name": "SOURCE_DT_URL_DISCONNECT", "value": SOURCE_DT_URL_DISCONNECT}
-            )
 
         if config.get("kind") == "Service":
             next_deployment_service_name = config.get("metadata").get("name")
@@ -277,17 +277,37 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
     operation_end_time = datetime.datetime.now()
     timestamps.append([operation_name, operation_start_time, operation_end_time])
 
-    # need to wait the new instance to do the migration
+    # call the rebuild endpoint
     resp = k8s_core_v1.read_namespaced_service(
         next_deployment_service_name, next_deployment_namespace
     )
     next_deployment_service_port = resp.spec.ports[0].node_port
     control_plane_ip = "10.16.11.142"
+    target_dt_rebuild_endpoint = (
+        f"http://{control_plane_ip}:{next_deployment_service_port}/rebuild"
+    )
+    target_dt_reconnect_endpoint = (
+        f"http://{control_plane_ip}:{next_deployment_service_port}/reconnect"
+    )
     target_dt_migration_done_url = (
         f"http://{control_plane_ip}:{next_deployment_service_port}/migration_status"
     )
 
     max_retries = 10
+    retries = 0
+    resp = None
+    while not resp or resp.status_code != 200:
+        if retries == max_retries:
+            logger.error("Hit max retries, returning.")
+            return
+        try:
+            resp = requests.post(url=target_dt_rebuild_endpoint)
+            retries += 1
+        except requests.exceptions.ConnectionError:
+            logger.info("Cannot connect to target dt.")
+            time.sleep(2.0)
+
+    # wait for the rebuild stage to end
     retries = 0
     resp = None
     while not resp or resp.json()["status"] != True:
@@ -301,21 +321,20 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
             retries += 1
             time.sleep(2.0)
 
-    operation_name = "Deleting old instance"
-    operation_start_time = operation_end_time
+    # reconnect mqtt
+    retries = 0
+    resp = None
+    while not resp or resp.status_code != 200:
+        if retries == max_retries:
+            logger.error("Hit max retries, returning.")
+            return
+        try:
+            resp = requests.post(url=target_dt_reconnect_endpoint)
+        except requests.exceptions.ConnectionError:
+            logger.info("Cannot connect to target dt.")
+            retries += 1
+            time.sleep(2.0)
 
-    # re route traffic to the new instance
-    # since it is supposed to use MQTT, no specific rerouting is necessary
-
-    # delete old instance
-    for depl in deployments:
-        if depl.get("affinity") == current_deployment_affinity:
-            for config in depl.get("configs"):
-                delete_from_dict(k8s_client, config)
-
-    ensure_pod_termination(k8s_core_v1, current_deployment_app_name, namespace, logger)
-    operation_end_time = datetime.datetime.now()
-    timestamps.append([operation_name, operation_start_time, operation_end_time])
 
     kopf.label(next_deployment_service, {"debug": "current-service"})
     resp = k8s_core_v1.patch_namespaced_service(

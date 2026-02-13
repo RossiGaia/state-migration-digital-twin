@@ -52,6 +52,7 @@ kind: Service
 metadata:
   name: mosquitto
 spec:
+  type: NodePort
   selector:
     app: mosquitto
   ports:
