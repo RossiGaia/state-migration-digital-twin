@@ -351,3 +351,4 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
     )
 
     return
+

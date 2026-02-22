@@ -14,7 +14,7 @@ from logging.handlers import RotatingFileHandler
 from prometheus_client import Gauge, generate_latest, CONTENT_TYPE_LATEST
 
 # metrics
-odte = Gauge(
+odte_metric = Gauge(
     "odte",
     "Overall Digital Twin Entanglement."
 )
@@ -54,6 +54,12 @@ rebuild_duration_time = Gauge(
     "Time to complete the rebuild phase. 0 if not set."
 )
 
+mqtt_request_disconnect_target_ts = Gauge(
+    "mqtt_request_disconnect_target_ts",
+    "Timestamp when mqtt disconnection is requested to target dt. 0 if not set."
+)
+
+
 mqtt_active_ts.set(0)
 mqtt_inactive_ts.set(0)
 processing_active_ts.set(0)
@@ -61,12 +67,13 @@ serializing_time.set(0)
 deserializing_time.set(0)
 live_migration_restore_time.set(0)
 rebuild_duration_time.set(0)
+mqtt_request_disconnect_target_ts.set(0)
 
 # for live migration
 migration_done = None
 
-# conf_path = "/app/dt/configs/config.yaml"
-conf_path = "./config.yaml"
+conf_path = "/app/dt/configs/config.yaml"
+# conf_path = "./config.yaml"
 confs = yaml.safe_load(open(conf_path))
 dt_name = confs["name"]
 flask_port = int(confs["flask"]["port"])
@@ -219,6 +226,8 @@ if source_dt_url_delta:
     if resp.status_code != 200:
         logger.error("Error in disconnecting the source DT")
         exit(1)
+    mqtt_disconnect_request_ts = time.time()
+    mqtt_request_disconnect_target_ts.set(mqtt_disconnect_request_ts)
 
     # call last delta
     logger.debug("Calling last delta.")
@@ -337,6 +346,8 @@ def odte():
 
 @app.route("/metrics")
 def get_metrics():
+    global odte_metric
+    odte_metric.set(processing.get_odte())
     return Response(generate_latest(), mimetype=CONTENT_TYPE_LATEST)
 
 @app.route("/delta")
