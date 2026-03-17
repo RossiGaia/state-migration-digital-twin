@@ -144,10 +144,13 @@ def ensure_pods_ready(k8s_core_v1, app_name, namespace, logger, poll_s=1):
             if not pod_ready:
                 time.sleep(poll_s)
 
+    return pod_name
+
 
 def ensure_pod_termination(k8s_core_v1, app_name, namespace, logger):
     terminated = False
     label_selector = f"app={app_name}"
+    pod_name = None
     while not terminated:
         try:
             resp = k8s_core_v1.list_namespaced_pod(
@@ -155,9 +158,11 @@ def ensure_pod_termination(k8s_core_v1, app_name, namespace, logger):
             )
             if len(resp.items) == 0:
                 terminated = True
+            else:
+                pod_name = resp.items[0].metadata.name
         except Exception as e:
             logger.info(f"Cannot list pods. {e}")
-
+    return pod_name
 
 @kopf.on.update("cyberphysicalapplications")
 def update_fn(name, spec, namespace, **kwargs):
@@ -177,15 +182,13 @@ def update_fn(name, spec, namespace, **kwargs):
 @kopf.on.field("cyberphysicalapplications", field="spec.migrate", old=False, new=True)
 def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
 
+    migration_start_ts = time.time()
+
     k8s_client = client.ApiClient()
     k8s_core_v1 = client.CoreV1Api()
     k8s_custom_object = client.CustomObjectsApi()
 
     # trigger a migration
-    timestamps = []
-
-    operation_name = "Creating new instance"
-    operation_start_time = datetime.datetime.now()
 
     # create new instance
     deployments = spec.get("deployments")
@@ -242,13 +245,10 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
             logger.exception("Exception creating new object.")
 
     # wait for it to start correctly
-    ensure_pods_ready(
+    new_pod_name = ensure_pods_ready(
         k8s_core_v1, next_deployment_app_name, next_deployment_namespace, logger
     )
     logger.info("Deployment's pods started.")
-
-    operation_end_time = datetime.datetime.now()
-    timestamps.append([operation_name, operation_start_time, operation_end_time])
 
     # need to wait to rebuild the state
     mirror_time = float(spec["mirrorTime"])
@@ -259,9 +259,6 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
 
     print(f"Deleting old instance.")
 
-    operation_name = "Deleting old instance"
-    operation_start_time = operation_end_time
-
     # re route traffic to the new instance
     # since it is supposed to use MQTT, no specific rerouting is necessary
 
@@ -271,9 +268,8 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
             for config in depl.get("configs"):
                 delete_from_dict(k8s_client, config)
 
-    ensure_pod_termination(k8s_core_v1, current_deployment_app_name, namespace, logger)
-    operation_end_time = datetime.datetime.now()
-    timestamps.append([operation_name, operation_start_time, operation_end_time])
+    old_pod_name = ensure_pod_termination(k8s_core_v1, current_deployment_app_name, namespace, logger)
+    pod_deletion_ts = time.time()
 
     kopf.label(next_deployment_service, {"debug": "current-service"})
     resp = k8s_core_v1.patch_namespaced_service(
@@ -281,6 +277,14 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
         next_deployment_namespace,
         next_deployment_service,
     )
+
+    migration_end_ts = time.time()
+
+    annotations_patch["metadata"]["annotations"]["migration-start-ts"] = str(migration_start_ts)
+    annotations_patch["metadata"]["annotations"]["migration-end-ts"] = str(migration_end_ts)
+    annotations_patch["metadata"]["annotations"]["pod-deletion-ts"] = str(pod_deletion_ts)
+    annotations_patch["metadata"]["annotations"]["new-pod-name"] = new_pod_name
+    annotations_patch["metadata"]["annotations"]["old-pod-name"] = old_pod_name
 
     group = "test.dev"
     version = "v1"

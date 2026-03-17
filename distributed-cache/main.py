@@ -12,6 +12,7 @@ import json
 import os
 from logging.handlers import RotatingFileHandler
 from prometheus_client import Gauge, generate_latest, CONTENT_TYPE_LATEST
+import redis
 
 # metrics
 odte_metric = Gauge(
@@ -81,27 +82,13 @@ process_conf = confs["process"]
 process_buffer_conf = process_conf["buffer"]["size"]
 process_burn_worker = process_conf["burn"]["workers"]
 process_burn_work = process_conf["burn"]["work"]
-process_do_periodic_checkpoints = process_conf["file_checkpoints"]["use"]
-process_periodic_checkpoints_interval = None
-process_periodic_checkpoints_file = None
-
-if process_do_periodic_checkpoints:
-    process_periodic_checkpoints_interval = process_conf["file_checkpoints"]["interval"]
-    process_periodic_checkpoints_file = process_conf["file_checkpoints"]["path"]
-
 connection_conf = confs["connections"]
 connection_buffer_conf = connection_conf["buffer"]["size"]
 connection_mqtt_conf = connection_conf["mqtt"]
-connection_mongo_conf = connection_conf["mongodb"]
-connection_use_mongo = connection_mongo_conf["use"]
-connection_mongo_url = None
-connection_mongo_db = None
-connection_mongo_collection = None
-
-if connection_use_mongo:
-    connection_mongo_url = connection_mongo_conf["url"]
-    connection_mongo_db = connection_mongo_conf["database"]
-    connection_mongo_collection = connection_mongo_conf["collection"]
+redis_confs = connection_conf["redis"]
+redis_host = redis_confs["host"]
+redis_port = redis_confs["port"]
+redis_db = int(redis_confs["db"])
 
 state_max_size = confs["state"]["max_size_mb"]
 
@@ -174,21 +161,18 @@ def graceful_shutdown(signum, frame):
 signal.signal(signal.SIGINT, graceful_shutdown)
 signal.signal(signal.SIGTERM, graceful_shutdown)
 
+redis_client = redis.StrictRedis(host=redis_host, port=redis_port, db=redis_db)
 
 app = Flask(__name__)
 
 processing_buffer = collections.deque(maxlen=process_buffer_conf)
 connection_buffer = collections.deque(maxlen=connection_buffer_conf)
-messages_buffer = collections.deque(maxlen=connection_buffer_conf)
+received_messages_buffer = collections.deque(maxlen=connection_buffer_conf)
 
 mqtt_connection = MqttConnection(
     connection_buffer=connection_buffer,
     mqtt_conf=connection_mqtt_conf,
-    use_mongo=connection_use_mongo,
-    mongo_url=connection_mongo_url,
-    mongo_db=connection_mongo_db,
-    mongo_collection=connection_mongo_collection,
-    messages_buffer=messages_buffer
+    messages_buffer=received_messages_buffer
 )
 processing = Processing(
     connection_buffer=connection_buffer,
@@ -196,69 +180,9 @@ processing = Processing(
     state_max_size=state_max_size,
     worker=process_burn_worker,
     work=process_burn_work,
-    use_mongo=connection_use_mongo,
-    mongo_url=connection_mongo_url,
-    mongo_db=connection_mongo_db,
-    mongo_collection=connection_mongo_collection,
-    do_periodic_dumps=process_do_periodic_checkpoints,
-    periodic_dumps_interval=process_periodic_checkpoints_interval,
-    periodic_dumps_file_path=process_periodic_checkpoints_file,
-    messages_buffer=messages_buffer
+    redis_client=redis_client,
+    messages_buffer=received_messages_buffer
 )
-
-# check if migrated dt
-# live replication
-source_dt_url_delta = os.environ.get("SOURCE_DT_URL_DELTA")
-source_dt_url_disconnect = os.environ.get("SOURCE_DT_URL_DISCONNECT")
-
-if source_dt_url_delta:
-    migration_done = False
-    restore_start_timestamp = time.time()
-    # start requesting delta
-    logger.info(f"DT is migrated. Starting live migration.")
-    max_rounds = int(confs["migration"]["live"]["rounds"])
-    for i in range(max_rounds - 1):
-        resp = requests.get(source_dt_url_delta)
-        obj = json.loads(resp.text)
-        processing.process_delta(obj)
-        time.sleep(1)
-
-    # call disconnect on old dt
-    logger.debug("Disconnecting source DT.")
-    resp = requests.post(source_dt_url_disconnect)
-    if resp.status_code != 200:
-        logger.error("Error in disconnecting the source DT")
-        exit(1)
-    mqtt_disconnect_request_ts = time.time()
-    mqtt_request_disconnect_target_ts.set(mqtt_disconnect_request_ts)
-
-    # call last delta
-    logger.debug("Calling last delta.")
-    resp = requests.get(source_dt_url_delta)
-    obj = json.loads(resp.text)
-    processing.process_delta(obj)
-
-    restore_end_timestamp = time.time()
-    live_migration_total_time = restore_end_timestamp - restore_start_timestamp
-    logger.info(f"Restoring total time: {live_migration_total_time}. Started at: {restore_start_timestamp}, ended at: {restore_end_timestamp}.")
-    live_migration_restore_time.set(live_migration_total_time)
-    # with open("test_file_dest.json", "x") as file:
-    #     file.writelines(json.dumps(processing.serialize_state()))
-
-startup_mqtt_connection = int(os.environ.get("STARTUP_MQTT_CONNECTION", 1))
-
-# storage rebinding
-# serialization file the same of config file
-serialize_from_file = bool(os.environ.get("DT_SERIALIZE_FROM_FILE", False))
-if serialize_from_file:
-    start = time.time()
-    with open(process_periodic_checkpoints_file, "r") as file:
-        lines = file.readlines()
-
-    serialized_state = json.loads(''.join(lines))
-    processing.deserialize_state(serialized_state)
-    total = time.time() - start
-    deserializing_time.set(total)
 
 
 @app.route("/rebuild", methods=["POST"])
@@ -376,13 +300,12 @@ def get_migration_status():
 if __name__ == "__main__":
     logger.debug("Started main.")
 
-    if startup_mqtt_connection != 0:
-        mqtt_t = threading.Thread(target=mqtt_connection.run)
-        mqtt_t.start()
-        mqtt_connected_ts = time.time()
-        mqtt_active_ts.set(mqtt_connected_ts)
-        logger.info(f"Connected to mqtt. Time: {mqtt_connected_ts}")
-        migration_done = True
+    mqtt_t = threading.Thread(target=mqtt_connection.run)
+    mqtt_t.start()
+    mqtt_connected_ts = time.time()
+    mqtt_active_ts.set(mqtt_connected_ts)
+    logger.info(f"Connected to mqtt. Time: {mqtt_connected_ts}")
+    migration_done = True
 
     processing_t = threading.Thread(target=processing.run)
     processing_t.start()

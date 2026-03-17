@@ -105,17 +105,21 @@ def choose_next_deployment(deployments, current_deployment_affinity):
     return random.choice(available_deployments) if available_deployments else None
 
 
-def ensure_pods_ready(k8s_core_v1, app_name, namespace, logger):
+def ensure_pods_ready(k8s_core_v1, app_name, namespace, logger, poll_s=1):
     """Wait until all pods of the deployment are ready."""
-
     label_selector = f"app={app_name}"
-    try:
-        resp = k8s_core_v1.list_namespaced_pod(namespace, label_selector=label_selector)
-    except:
-        logger.error("Cannot list pods.")
-        return
 
-    pods = resp.items
+    pods = None
+    while not pods:
+        try:
+            resp = k8s_core_v1.list_namespaced_pod(namespace, label_selector=label_selector)
+        except Exception as e:
+            logger.error("Cannot list pods: %s", e)
+            return
+
+        pods = resp.items or []
+        if not pods:
+            time.sleep(poll_s)
 
     for pod in pods:
         pod_ready = False
@@ -124,18 +128,27 @@ def ensure_pods_ready(k8s_core_v1, app_name, namespace, logger):
         while not pod_ready:
             try:
                 pod_status = k8s_core_v1.read_namespaced_pod_status(pod_name, namespace)
-            except:
-                logger.error("Cannot read pod status.")
+            except Exception as e:
+                logger.error("Cannot read pod status for %s: %s", pod_name, e)
+                time.sleep(poll_s)
+                continue
 
-            conditions = pod_status.status.conditions
+            conditions = (pod_status.status.conditions or [])
             for condition in conditions:
                 if condition.type == "Ready" and condition.status == "True":
                     pod_ready = True
+                    break
+
+            if not pod_ready:
+                time.sleep(poll_s)
+
+    return pod_name
 
 
 def ensure_pod_termination(k8s_core_v1, app_name, namespace, logger):
     terminated = False
     label_selector = f"app={app_name}"
+    pod_name = None
     while not terminated:
         try:
             resp = k8s_core_v1.list_namespaced_pod(
@@ -143,9 +156,11 @@ def ensure_pod_termination(k8s_core_v1, app_name, namespace, logger):
             )
             if len(resp.items) == 0:
                 terminated = True
+            else:
+                pod_name = resp.items[0].metadata.name
         except Exception as e:
             logger.info(f"Cannot list pods. {e}")
-
+    return pod_name
 
 @kopf.on.update("cyberphysicalapplications")
 def update_fn(name, spec, namespace, **kwargs):
@@ -165,12 +180,13 @@ def update_fn(name, spec, namespace, **kwargs):
 @kopf.on.field("cyberphysicalapplications", field="spec.migrate", old=False, new=True)
 def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
 
+    migration_start_ts = time.time()
+
     k8s_client = client.ApiClient()
     k8s_core_v1 = client.CoreV1Api()
     k8s_custom_object = client.CustomObjectsApi()
 
     # trigger a migration
-    timestamps = []
 
     # get vars
     deployments = spec.get("deployments")
@@ -191,9 +207,6 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
 
 
     # call checkpoint api on the node where the pod is currently running
-    operation_name = "Checkpoint old instance"
-    operation_start_time = datetime.datetime.now()
-
     # get the node where the pod is running
     label_selector = f"app={current_deployment_app_name}"
     resp = k8s_core_v1.list_namespaced_pod(
@@ -209,16 +222,30 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
     current_container_name = resp.items[0].spec.containers[0].name
     host_ip = resp.items[0].status.host_ip
 
+    # start the new instance with env vars so it knows it is migrated
+    label_selector = "debug=current-service"
+    resp = k8s_core_v1.list_namespaced_service(
+        current_deployment_namespace, label_selector=label_selector
+    )
+    current_deployment_service_port = resp.items[0].spec.ports[0].node_port
+
     # disconnect dt from mqtt
+    max_disconnect_retry = 5
     cluster_ip = "10.16.11.142"
-    port = "30000"
-    disconnect_url = f"http://{cluster_ip}:{port}/disconnect"
+    disconnect_url = f"http://{cluster_ip}:{current_deployment_service_port}/disconnect"
     resp = requests.post(disconnect_url)
-    if resp.status_code != 200:
-        logger.error(f"Error in mqtt disconnection.")
-        return
     
-    logger.debug(f"Mqtt disconnected")
+    while resp.status_code != 200 and max_disconnect_retry > 0:
+        logger.error("MQTT disconnection failed. Retrying.")
+        max_disconnect_retry -= 1
+        resp = requests.post(disconnect_url)
+        time.sleep(0.5)
+
+    if max_disconnect_retry == 0 and resp.status_code != 200:
+        logger.error("MQTT disconnection not doable. Exiting.")
+        return
+
+    logger.info(f"Mqtt disconnected.")
 
     # call the checkpoint api
     checkpoint_url = f"http://{host_ip}:9000/checkpoint"
@@ -240,36 +267,35 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
         "token": token
     }
 
-    resp = requests.post(checkpoint_url, headers=headers, data=json.dumps(data))
-    print(resp.text)
-
-    if resp.status_code == 500:
-        logger.error(f"Error in the checkpoint call.")
-        return
-
     new_image_name = f"rssgai/checkpoint-image:{pod_name}_{container_name}"
     print(new_image_name)
 
-    operation_end_time = datetime.datetime.now()
-    timestamps.append([operation_name, operation_start_time, operation_end_time])
+    resp = requests.post(checkpoint_url, headers=headers, data=json.dumps(data))
+    print(resp.text)
 
+    max_checkpoint_retry = 5
+    while (resp.json()["status"] != "ok" or resp.status_code == 500) and max_checkpoint_retry > 0:
+        logger.error("cURL did not run correctly. Should retry.")
+        max_checkpoint_retry -= 1
+        resp = requests.post(checkpoint_url, headers=headers, data=json.dumps(data))
+        print(resp.text)
+        time.sleep(0.5)
+        
+
+    if (resp.json()["status"] != "ok" or resp.status_code == 500) and max_checkpoint_retry == 0:
+        logger.error("Checkpoint not doable. Exiting.")
+        return
 
     # stop the currently running pod
-    operation_name = "Deleting old instance"
-    operation_start_time = operation_end_time
     for depl in deployments:
         if depl.get("affinity") == current_deployment_affinity:
             for config in depl.get("configs"):
                 delete_from_dict(k8s_client, config)
 
-    ensure_pod_termination(k8s_core_v1, current_deployment_app_name, namespace, logger)
-    operation_end_time = datetime.datetime.now()
-    timestamps.append([operation_name, operation_start_time, operation_end_time])
-    
+    old_pod_name = ensure_pod_termination(k8s_core_v1, current_deployment_app_name, namespace, logger)
+    pod_deletion_ts = time.time()
 
     # start the new pod with the restored image (override the image from confs)
-    operation_name = "Start new instance"
-    operation_start_time = operation_end_time
     annotations_patch = {"metadata": {"annotations": dict(meta.annotations)}}
     for config in next_deployment_configs:
         if config.get("kind") == "Deployment":
@@ -324,7 +350,7 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
     )
 
     # wait for it to start correctly
-    ensure_pods_ready(
+    new_pod_name = ensure_pods_ready(
         k8s_core_v1, next_deployment_app_name, next_deployment_namespace, logger
     )
     logger.info("Deployment's pods started.")
@@ -336,16 +362,45 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
         next_deployment_service,
     )
 
-    operation_end_time = datetime.datetime.now()
-    timestamps.append([operation_name, operation_start_time, operation_end_time])
+    # ask new service port
+    label_selector = "debug=current-service"
+    resp = k8s_core_v1.list_namespaced_service(
+        current_deployment_namespace, label_selector=label_selector
+    )
+    current_deployment_service_port = resp.items[0].spec.ports[0].node_port
 
-    time.sleep(2)
+    max_reconnection_retry = 5
 
     # restart the mqtt client on the dt
-    reconnect_url = f"http://{cluster_ip}:{port}/reconnect"
+    reconnect_url = f"http://{cluster_ip}:{current_deployment_service_port}/reconnect"
     resp = requests.post(reconnect_url)
-    if resp.status_code != 200:
-        logger.error(f"Error in mqtt reconnnection.")
+    
+    while resp.status_code != 200 and max_reconnection_retry > 0:
+        logger.error("MQTT reconnection failed. Retrying.")
+        resp = requests.post(reconnect_url)
+        max_reconnection_retry -= 1
+        time.sleep(0.5)
+
+
+    if max_reconnection_retry == 0 and resp.status_code != 200:
+        logger.error("MQTT reconnection not doable. Exiting.")
         return
+
+    logger.info("MQTT reconnection successful.")
+
+    migration_end_ts = time.time()
+
+    annotations_patch["metadata"]["annotations"]["migration-start-ts"] = str(migration_start_ts)
+    annotations_patch["metadata"]["annotations"]["migration-end-ts"] = str(migration_end_ts)
+    annotations_patch["metadata"]["annotations"]["pod-deletion-ts"] = str(pod_deletion_ts)
+    annotations_patch["metadata"]["annotations"]["new-pod-name"] = new_pod_name
+    annotations_patch["metadata"]["annotations"]["old-pod-name"] = old_pod_name
+
+    group = "test.dev"
+    version = "v1"
+    plural = "cyberphysicalapplications"
+    resp = k8s_custom_object.patch_namespaced_custom_object(
+        group, version, namespace, plural, name, body=annotations_patch
+    )
 
     return

@@ -104,6 +104,9 @@ def choose_next_deployment(deployments, current_deployment_affinity):
     ]
     return random.choice(available_deployments) if available_deployments else None
 
+
+import time
+
 def ensure_pods_ready(k8s_core_v1, app_name, namespace, logger, poll_s=1):
     """Wait until all pods of the deployment are ready."""
     label_selector = f"app={app_name}"
@@ -200,18 +203,18 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
     next_deployment_configs = next_deployment.get("configs")
     next_deployment_affinity = next_deployment.get("affinity")
 
-    # start the new instance with env vars so it knows it is migrated
-    label_selector = "debug=current-service"
-    resp = k8s_core_v1.list_namespaced_service(
-        current_deployment_namespace, label_selector=label_selector
-    )
-    current_deployment_service_name = resp.items[0].metadata.name
-    current_deployment_service_namespace = resp.items[0].metadata.namespace
-    current_deployment_service_port = resp.items[0].spec.ports[0].target_port
 
-    SOURCE_DT_URL_DELTA = f"http://{current_deployment_service_name}.{current_deployment_service_namespace}.svc.cluster.local:{current_deployment_service_port}/delta"
-    SOURCE_DT_URL_DISCONNECT = f"http://{current_deployment_service_name}.{current_deployment_service_namespace}.svc.cluster.local:{current_deployment_service_port}/disconnect"
+    # delete old instance
+    for depl in deployments:
+        if depl.get("affinity") == current_deployment_affinity:
+            for config in depl.get("configs"):
+                delete_from_dict(k8s_client, config)
 
+    old_pod_name = ensure_pod_termination(k8s_core_v1, current_deployment_app_name, namespace, logger)
+    pod_deletion_ts = time.time()
+    logger.info(f"Pod deleted at: {pod_deletion_ts}")
+
+    # start the new instance
     annotations_patch = {"metadata": {"annotations": dict(meta.annotations)}}
     for config in next_deployment_configs:
         if config.get("kind") == "Deployment":
@@ -239,22 +242,6 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
                 "child-deployment-affinity"
             ] = next_deployment_affinity
 
-            if "env" in config["spec"]["template"]["spec"]["containers"][0]:
-                config["spec"]["template"]["spec"]["containers"][0]["env"].append(
-                    {"name": "SOURCE_DT_URL_DELTA", "value": SOURCE_DT_URL_DELTA}
-                )
-            else:
-                config["spec"]["template"]["spec"]["containers"][0]["env"] = [
-                    {
-                        "name": "SOURCE_DT_URL_DELTA",
-                        "value": SOURCE_DT_URL_DELTA,
-                    }
-                ]
-
-            config["spec"]["template"]["spec"]["containers"][0]["env"].append(
-                {"name": "SOURCE_DT_URL_DISCONNECT", "value": SOURCE_DT_URL_DISCONNECT}
-            )
-
         if config.get("kind") == "Service":
             next_deployment_service_name = config.get("metadata").get("name")
             next_deployment_service = config
@@ -266,48 +253,6 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
         except:
             logger.exception("Exception creating new object.")
 
-    # wait for it to start correctly
-    new_pod_name = ensure_pods_ready(
-        k8s_core_v1, next_deployment_app_name, next_deployment_namespace, logger
-    )
-    logger.info("Deployment's pods started.")
-
-    # need to wait the new instance to do the migration
-    resp = k8s_core_v1.read_namespaced_service(
-        next_deployment_service_name, next_deployment_namespace
-    )
-    next_deployment_service_port = resp.spec.ports[0].node_port
-    control_plane_ip = "10.16.11.142"
-    target_dt_migration_done_url = (
-        f"http://{control_plane_ip}:{next_deployment_service_port}/migration_status"
-    )
-
-    max_retries = 10
-    retries = 0
-    resp = None
-    while not resp or resp.json()["status"] != True:
-        if retries == max_retries:
-            logger.error("Hit max retries, returning.")
-            return
-        try:
-            resp = requests.get(url=target_dt_migration_done_url)
-        except requests.exceptions.ConnectionError:
-            logger.info("Cannot connect to target dt.")
-            retries += 1
-            time.sleep(2.0)
-
-    # re route traffic to the new instance
-    # since it is supposed to use MQTT, no specific rerouting is necessary
-
-    # delete old instance
-    for depl in deployments:
-        if depl.get("affinity") == current_deployment_affinity:
-            for config in depl.get("configs"):
-                delete_from_dict(k8s_client, config)
-
-    old_pod_name = ensure_pod_termination(k8s_core_v1, current_deployment_app_name, namespace, logger)
-    pod_deletion_ts = time.time()
-    logger.info(f"Pod deleted at: {pod_deletion_ts}")
 
     kopf.label(next_deployment_service, {"debug": "current-service"})
     resp = k8s_core_v1.patch_namespaced_service(
@@ -315,6 +260,14 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
         next_deployment_namespace,
         next_deployment_service,
     )
+
+
+    # wait for it to start correctly
+    new_pod_name = ensure_pods_ready(
+        k8s_core_v1, next_deployment_app_name, next_deployment_namespace, logger
+    )
+    
+    logger.info("Deployment's pods started.")
 
     migration_end_ts = time.time()
 

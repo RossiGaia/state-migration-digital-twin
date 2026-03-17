@@ -52,17 +52,40 @@ DT_GAUGES = [
 ]
 
 DT_LABEL_SELECTOR_TEMPLATE = os.getenv(
-    "DT_LABEL_SELECTOR_TEMPLATE",
-    'kubernetes_pod_name="%POD%"'
+    "DT_LABEL_SELECTOR_TEMPLATE", 'kubernetes_pod_name="%POD%"'
 )
 
 INFRA_POD_LABEL = os.getenv("INFRA_POD_LABEL", "pod")
 INFRA_QUERIES = [
-    ("cpu_sum_rate_1m", f'sum(rate(container_cpu_usage_seconds_total{{{INFRA_POD_LABEL}="%POD%"}}[1m]))'),
-    ("mem_sum_bytes",   f'sum(container_memory_usage_bytes{{{INFRA_POD_LABEL}="%POD%"}})'),
-    ("net_rx_tx_rate_1m",
-     f'sum(rate(container_network_receive_bytes_total{{{INFRA_POD_LABEL}="%POD%"}}[1m])) + '
-     f'sum(rate(container_network_transmit_bytes_total{{{INFRA_POD_LABEL}="%POD%"}}[1m]))'),
+    (
+        "cpu_sum_irate_1m",
+        f'sum(irate(container_cpu_usage_seconds_total{{{INFRA_POD_LABEL}=~"%POD%", container=""}}[1m]))',
+    ),
+    (
+        "mem_sum_bytes",
+        f'sum(container_memory_usage_bytes{{{INFRA_POD_LABEL}=~"%POD%"}})',
+    ),
+    (
+        "net_rx_tx_irate_1m",
+        f'sum(irate(container_network_receive_bytes_total{{{INFRA_POD_LABEL}=~"%POD%"}}[1m])) + '
+        f'sum(irate(container_network_transmit_bytes_total{{{INFRA_POD_LABEL}=~"%POD%"}}[1m]))',
+    ),
+]
+
+INFRA_QUERIES_RAW = [
+    ("mem_bytes_raw", f'container_memory_usage_bytes{{{INFRA_POD_LABEL}=~"%POD%"}}'),
+    (
+        "container_cpu_usage_seconds_total",
+        f'container_cpu_usage_seconds_total{{{INFRA_POD_LABEL}=~"%POD%", container=""}}',
+    ),
+    (
+        "container_network_receive_bytes_total",
+        f'container_network_receive_bytes_total{{{INFRA_POD_LABEL}=~"%POD%"}}',
+    ),
+    (
+        "container_network_transmit_bytes_total",
+        f'container_network_transmit_bytes_total{{{INFRA_POD_LABEL}=~"%POD%"}}',
+    ),
 ]
 
 
@@ -105,7 +128,9 @@ def prom_query_range(
 # KUBECTL HELPERS
 # ----------------------------
 def run_kubectl(args: List[str], check: bool = True) -> str:
-    p = subprocess.run(["kubectl"] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    p = subprocess.run(
+        ["kubectl"] + args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+    )
     if check and p.returncode != 0:
         raise RuntimeError(f"kubectl failed: kubectl {' '.join(args)}\n{p.stderr}")
     return p.stdout.strip()
@@ -114,19 +139,25 @@ def run_kubectl(args: List[str], check: bool = True) -> str:
 def patch_migrate(value: bool) -> None:
     val = "true" if value else "false"
     patch = f'{{"spec": {{"migrate": {val}}}}}'
-    run_kubectl(["patch", CR_KIND, CR_NAME, "-n", NAMESPACE, "--type", "merge", "-p", patch])
+    run_kubectl(
+        ["patch", CR_KIND, CR_NAME, "-n", NAMESPACE, "--type", "merge", "-p", patch]
+    )
 
 
 def get_annotation(key: str) -> str:
     jp = f"jsonpath={{.metadata.annotations['{key}']}}"
-    return run_kubectl(["get", CR_KIND, CR_NAME, "-n", NAMESPACE, "-o", jp], check=False).strip()
+    return run_kubectl(
+        ["get", CR_KIND, CR_NAME, "-n", NAMESPACE, "-o", jp], check=False
+    ).strip()
 
 
 def get_annotations(keys: List[str]) -> Dict[str, str]:
     return {k: get_annotation(k) for k in keys}
 
 
-def wait_for_migration_done(prev_end_ts: str, timeout_sec: int) -> Tuple[Dict[str, str], bool]:
+def wait_for_migration_done(
+    prev_end_ts: str, prev_start_ts: str, timeout_sec: int
+) -> Tuple[Dict[str, str], bool]:
     elapsed = 0.0
     last_ann: Dict[str, str] = {}
     while elapsed < timeout_sec:
@@ -140,6 +171,7 @@ def wait_for_migration_done(prev_end_ts: str, timeout_sec: int) -> Tuple[Dict[st
             start_ts != ""
             and end_ts != ""
             and (prev_end_ts.strip() == "" or end_ts != prev_end_ts.strip())
+            and (prev_start_ts.strip() == "" or start_ts != prev_start_ts.strip())
             and old_pod != ""
             and new_pod != ""
         )
@@ -166,17 +198,30 @@ def sanitize_filename(s: str) -> str:
 def fill_selector(template: str, pod: str, ann: Dict[str, str]) -> str:
     app = (ann.get("child-deployment-app-name") or "").strip()
     pod_prefix = pod.split("-")[0] if pod else ""
-    return (template
-            .replace("%POD%", pod)
-            .replace("%APP%", app)
-            .replace("%POD_PREFIX%", pod_prefix))
+    return (
+        template.replace("%POD%", pod)
+        .replace("%APP%", app)
+        .replace("%POD_PREFIX%", pod_prefix)
+    )
 
 
-def build_queries_for_pod(pod: str, ann: Dict[str, str]) -> List[QuerySpec]:
+def build_dt_queries_for_pod(pod: str, ann: Dict[str, str]) -> List[QuerySpec]:
     selector = fill_selector(DT_LABEL_SELECTOR_TEMPLATE, pod, ann)
-    gauge_queries = [QuerySpec(name=g, promql=f'{g}{{{selector}}}') for g in DT_GAUGES]
-    infra_queries = [QuerySpec(name=n, promql=q.replace("%POD%", pod)) for (n, q) in INFRA_QUERIES]
-    return gauge_queries + infra_queries
+    return [QuerySpec(name=g, promql=f"{g}{{{selector}}}") for g in DT_GAUGES]
+
+
+def build_infra_queries_total() -> List[QuerySpec]:
+    return [
+        QuerySpec(name=n, promql=q.replace("%POD%", "dt-1-.*"))
+        for (n, q) in INFRA_QUERIES
+    ]
+
+
+def build_infra_queries_raw_total() -> List[QuerySpec]:
+    return [
+        QuerySpec(name=n, promql=q.replace("%POD%", "dt-1-.*"))
+        for (n, q) in INFRA_QUERIES_RAW
+    ]
 
 
 def init_run_csv(run_id: str) -> Tuple[str, csv.DictWriter, Any]:
@@ -185,12 +230,18 @@ def init_run_csv(run_id: str) -> Tuple[str, csv.DictWriter, Any]:
     f = open(out_csv, "w", newline="", encoding="utf-8")
 
     # colonne fisse + annotation + info serie
-    fieldnames = (
-        ["run_id", "iteration", "which", "pod", "metric", "promql",
-         "timestamp_unix", "timestamp_iso", "value",
-         "series_labels_json"]
-        + [f"ann_{k}" for k in CAPTURE_ANNOT_KEYS]
-    )
+    fieldnames = [
+        "run_id",
+        "iteration",
+        "which",
+        "pod",
+        "metric",
+        "promql",
+        "timestamp_unix",
+        "timestamp_iso",
+        "value",
+        "series_labels_json",
+    ] + [f"ann_{k}" for k in CAPTURE_ANNOT_KEYS]
     w = csv.DictWriter(f, fieldnames=fieldnames)
     w.writeheader()
     return out_csv, w, f
@@ -250,65 +301,107 @@ def main() -> None:
 
             if i != 1:
                 prev_end_ts = get_annotation("migration-end-ts")
+                prev_start_ts = get_annotation("migration-start-ts")
             else:
                 prev_end_ts = ""
-                
+                prev_start_ts = ""
+
             patch_migrate(True)
 
-            ann, done = wait_for_migration_done(prev_end_ts, MIGRATION_DONE_TIMEOUT_SEC)
+            ann, done = wait_for_migration_done(
+                prev_end_ts, prev_start_ts, MIGRATION_DONE_TIMEOUT_SEC
+            )
             if not done:
-                print("WARNING: migration did not reach done condition within timeout; exporting with last known annotations")
+                print(
+                    "WARNING: migration did not reach done condition within timeout; exporting with last known annotations"
+                )
 
             old_pod = (ann.get("old-pod-name") or "").strip()
             new_pod = (ann.get("new-pod-name") or "").strip()
 
-            # finestra query_range presa da start/end epoch dell'operatore
             try:
-                start_epoch = float((ann.get("migration-start-ts") or "0").strip() or "0")
+                start_epoch = float(
+                    (ann.get("migration-start-ts") or "0").strip() or "0"
+                )
                 end_epoch = float((ann.get("migration-end-ts") or "0").strip() or "0")
             except ValueError:
                 start_epoch, end_epoch = 0.0, 0.0
 
             if start_epoch <= 0:
-                start_epoch = time.time() - 10
+                start_epoch = time.time() - 30
             if end_epoch <= 0 or end_epoch < start_epoch:
                 end_epoch = time.time()
+
+            extended_start = epoch_to_dt_utc(start_epoch - 90)
+            extended_end = epoch_to_dt_utc(end_epoch + 60)
 
             start_dt = epoch_to_dt_utc(start_epoch)
             end_dt = epoch_to_dt_utc(end_epoch)
 
             print(f"Pods: old={old_pod} new={new_pod}")
             print(f"Prometheus: {PROM_URL}")
-            print(f"Window UTC: {start_dt.isoformat()} -> {end_dt.isoformat()} step={PROM_STEP}")
+            print(
+                f"Window UTC: {start_dt.isoformat()} -> {end_dt.isoformat()} step={PROM_STEP}"
+            )
 
-            time.sleep(30)
+            time.sleep(60)
 
             for which, pod in (("old", old_pod), ("new", new_pod)):
                 if not pod:
                     continue
 
-                queries = build_queries_for_pod(pod, ann)
+                dt_queries = build_dt_queries_for_pod(pod, ann)
 
-                for q in queries:
+                for q in dt_queries:
                     data = prom_query_range(
                         base_url=PROM_URL,
                         promql=q.promql,
-                        start_ts=start_dt,
-                        end_ts=end_dt,
+                        start_ts=extended_start,
+                        end_ts=extended_end,
                         step=PROM_STEP,
                     )
                     result = data.get("data", {}).get("result", []) or []
                     write_series_to_csv(writer, run_id, i, which, pod, q, result, ann)
 
+            infra_pod = "dt-1-.*"
+            infra_queries = build_infra_queries_total()
+
+            for q in infra_queries:
+                data = prom_query_range(
+                    base_url=PROM_URL,
+                    promql=q.promql,
+                    start_ts=extended_start,
+                    end_ts=extended_end,
+                    step=PROM_STEP,
+                )
+                result = data.get("data", {}).get("result", []) or []
+                write_series_to_csv(
+                    writer, run_id, i, "total", infra_pod, q, result, ann
+                )
+
+            for q in build_infra_queries_raw_total():
+                data = prom_query_range(
+                    base_url=PROM_URL,
+                    promql=q.promql,
+                    start_ts=extended_start,
+                    end_ts=extended_end,
+                    step=PROM_STEP,
+                )
+                result = data.get("data", {}).get("result", []) or []
+                write_series_to_csv(
+                    writer, run_id, i, "raw", infra_pod, q, result, ann
+                )
+
             fh.flush()
 
             patch_migrate(False)
-            time.sleep(30)
+            time.sleep(5)
 
     finally:
         fh.close()
 
     print("\nDone.")
+
 
 if __name__ == "__main__":
     main()

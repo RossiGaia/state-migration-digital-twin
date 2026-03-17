@@ -17,3 +17,10 @@ buildah commit "$newcontainer" checkpoint-image:"${CRIU_DUMP_POD_NAME}_${CRIU_DU
 buildah rm "$newcontainer"
 buildah tag localhost/checkpoint-image:"${CRIU_DUMP_POD_NAME}_${CRIU_DUMP_CONTAINER_NAME}" docker.io/rssgai/checkpoint-image:"${CRIU_DUMP_POD_NAME}_${CRIU_DUMP_CONTAINER_NAME}"
 buildah push docker.io/rssgai/checkpoint-image:"${CRIU_DUMP_POD_NAME}_${CRIU_DUMP_CONTAINER_NAME}"
+
+# Cleanup checkpoint tar
+rm -f "${TAR_PATH}"
+
+# remove local images
+buildah rmi docker.io/rssgai/checkpoint-image:"${CRIU_DUMP_POD_NAME}_${CRIU_DUMP_CONTAINER_NAME}"
+buildah rmi localhost/checkpoint-image:"${CRIU_DUMP_POD_NAME}_${CRIU_DUMP_CONTAINER_NAME}"

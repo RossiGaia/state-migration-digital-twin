@@ -57,15 +57,9 @@ class Processing:
         state_max_size=None,
         worker=0,
         work=0,
-        use_mongo=False,
-        mongo_url=None,
-        mongo_db=None,
-        mongo_collection=None,
         config: ProcessingConfig | None = None,
-        do_periodic_dumps=False,
-        periodic_dumps_interval=0,
-        periodic_dumps_file_path=None,
-        messages_buffer,
+        redis_client=None,
+        messages_buffer
     ):
         self.connection_buffer = connection_buffer
         self.processing_buffer = processing_buffer
@@ -75,34 +69,17 @@ class Processing:
         self.state_max_size = state_max_size
         self.odte = None
         self.lock = threading.Lock()
-        self.transmitted_state = {}
         self.burn_worker = worker
         self.burn_work = work
         self.burn_queue = queue.Queue(maxsize=self.burn_worker * 2)
         self.burn_threads = []
         self.processing_seq_no = 0
-        self.last_transmitted_processing_seq_no = -1
-        self.use_mongo = use_mongo
-        self.mongo_url = mongo_url
-        self.mongo_db = mongo_db
-        self.mongo_collection = mongo_collection
         self.cfg = config or ProcessingConfig()
-        self.do_periodic_dumps = do_periodic_dumps
-        self.periodic_dumps_interval = periodic_dumps_interval
-        self.periodic_dumps_file_path = periodic_dumps_file_path
         self.odte_t = threading.Thread(target=self.odte_computation, daemon=True)
+        self.redis_client = redis_client
+        self.message_seq_id = None
         self.messages_buffer = messages_buffer
         self.burn_feeder_t = threading.Thread(target=self.burn_feeder_loop, daemon=True)
-
-        if self.use_mongo:
-            try:
-                self.mongo_client = pymongo.MongoClient(self.mongo_url)
-            except:
-                logger.error("Could not connect to mongo.")
-                sys.exit(1)
-
-        if self.do_periodic_dumps:
-            self.periodic_dumps_t = threading.Thread(target=self.periodic_dump, daemon=True)
 
         if self.burn_worker > 0 and self.burn_work > 0:
             for i in range(self.burn_worker):
@@ -113,9 +90,7 @@ class Processing:
             self.burn_feeder_t.start()
 
     def run(self):
-        
-        if self.do_periodic_dumps:
-            self.periodic_dumps_t.start()
+
         self.odte_t.start()
 
         while self.running:
@@ -131,20 +106,73 @@ class Processing:
                 time.sleep(0.001)
                 continue
 
+            current_seq_id = raw_msg["payload"]["seq_id"]
+            logger.debug(f"Seq_id: {current_seq_id}")
+
+            # get the state from the shared storage
+            self._get_state_from_redis()
+
+            self.message_seq_id = current_seq_id
             snap = self._build_snap(raw_msg)
             self._add_derived_metrics(snap)
             self._add_rolling_features(snap)
             self._add_health_and_anomalies(snap)
             self._maybe_pad(snap)
 
-            processing_time = time.time() - t0
+            t1 = time.time()
+
+            processing_time = t1 - t0
             snap["processing_time_s"] = processing_time
+
+            creation_timestamp = raw_msg["payload"]["creation_timestamp"]
+            received_timestamp = raw_msg["recv_timestamp"]
+            processed_timestamp = t1
+
+            logger.debug(
+                f"Processing elaborated message {self.message_seq_id}:\ngenerated at: {creation_timestamp}\narrived at {received_timestamp}\nprocessed at: {processed_timestamp}"
+            )
+
+            logger.debug(f"Delay between creation and processing: {processed_timestamp-creation_timestamp} s")
+            logger.debug(f"Delay between creation and received: {received_timestamp-creation_timestamp} s")
 
             with self.lock:
                 self.processing_buffer.append(snap)
                 self._record_observation(snap, processing_time)
 
             logger.debug(f"time to elaborate the message: {processing_time}")
+
+            # push the state to the shared storage
+            self._set_state_in_redis()
+
+    def _get_state_from_redis(self):
+        state_json = self.redis_client.get("digital_twin_state")
+        if state_json:
+            self.deserialize_state(json.loads(state_json))
+            logger.info("Digital Twin state restored from Redis.")
+
+    def _set_state_in_redis(self):
+        lock = self.redis_client.lock(f"dt-lock", blocking=False)
+
+        state_json = json.dumps(self.serialize_state())
+        acquired = False
+        try:
+            acquired = lock.acquire()
+            if not acquired:
+                logger.debug("Lock not acquired, skipping write.")
+                return
+
+            self.redis_client.set("digital_twin_state", state_json)
+            logger.info("Digital Twin state saved to Redis.")
+
+        except Exception as e:
+            logger.warning(f"Redis write failed: {e}")
+
+        finally:
+            if acquired:
+                try:
+                    lock.release()
+                except Exception:
+                    pass
 
     def _build_snap(self, raw_msg: dict) -> dict:
         payload = raw_msg["payload"]
@@ -384,79 +412,31 @@ class Processing:
         start_time = time.time()
         with self.lock:
             state = {
-                "connection_buffer": list(self.connection_buffer),
                 "processing_buffer": list(self.processing_buffer),
                 "conveyor_params": asdict(self.conveyor_params),
-                "state_max_size": self.state_max_size,
-                "connection_buffer_maxlen": self.connection_buffer.maxlen,
-                "processing_buffer_maxlen": self.processing_buffer.maxlen,
             }
         serialization_time = time.time() - start_time
         logger.info(f"Serialization took {serialization_time} seconds.")
         return state
 
+
     def deserialize_state(self, serialized_state):
         start_time = time.time()
         with self.lock:
             try:
-                connection_buffer_maxlen = serialized_state["connection_buffer_maxlen"]
-                processing_buffer_maxlen = serialized_state["processing_buffer_maxlen"]
-                self.connection_buffer = collections.deque(
-                    serialized_state["connection_buffer"],
-                    maxlen=connection_buffer_maxlen,
-                )
-                self.processing_buffer = collections.deque(
-                    serialized_state["processing_buffer"],
-                    maxlen=processing_buffer_maxlen,
-                )
+                self.processing_buffer.clear()
+                self.processing_buffer.extend(serialized_state["processing_buffer"])
                 self.conveyor_params = VirtualizedConveyorPlant(
                     **serialized_state["conveyor_params"]
                 )
-                self.state_max_size = serialized_state["state_max_size"]
             except Exception as e:
                 logger.error(f"Error in deserialization. {e}")
-                logger.error(
-                    f"Connection buffer -> {serialized_state['connection_buffer']}"
-                )
                 return -1
+            
         deserialization_time = time.time() - start_time
         logger.info(f"Deserialization took {deserialization_time} seconds.")
         return 0
-
-    def rebuild(self):
-        t0 = time.time()
-        logger.debug(f"Use mongo is {self.use_mongo}")
-        if not self.use_mongo:
-            return
-
-        coll = self.mongo_client[self.mongo_db][self.mongo_collection]
-
-        cursor = coll.find({}).sort("payload.seq_id", 1)
-        events = list(cursor)
-        # logger.debug(f"Documents retrived:\n{events}")
-
-        rebuilt = []
-            
-
-        for doc in events:
-            if "payload" not in doc:
-                continue
-            
-            message = {
-                    "payload": doc["payload"],
-                    "recv_timestamp": doc.get("recv_timestamp", time.time()),
-                    "key": doc.get("key", str(doc.get("_id"))),
-                }
-
-            while len(self.connection_buffer) == 100:
-                time.sleep(0.1)
-
-            with self.lock:
-                self.connection_buffer.append(message)
-
-
-        mongo_docs_retrival_time = time.time() - t0
-        logger.info(f"Time to retrieve mongo docs {mongo_docs_retrival_time}.")
+    
 
     def odte_computation(self):
         while self.running:
@@ -474,85 +454,6 @@ class Processing:
         with self.lock:
             return self.odte
 
-    def get_delta(self):
-        current_state = self.serialize_state()
-        current_conveyor_params = current_state["conveyor_params"]
-        if self.transmitted_state == {}:
-            transmitted_conveyor_params = {}
-        else:
-            transmitted_conveyor_params = self.transmitted_state.get(
-                "conveyor_params", {}
-            )
-
-        conveyor_params_diff = {}
-        for key, value in current_conveyor_params.items():
-            if key in transmitted_conveyor_params:
-                transmitted_value = transmitted_conveyor_params[key]
-                if value != transmitted_value:
-                    conveyor_params_diff[key] = value
-            else:
-                conveyor_params_diff[key] = value
-
-        # processing buffer
-        current_proc_buffer = current_state["processing_buffer"]
-        new_proc_buffer = []
-        max_seq_seen = self.last_transmitted_processing_seq_no
-
-        for entry in current_proc_buffer:
-            seq = entry["seq_id"]
-            if seq > self.last_transmitted_processing_seq_no:
-                new_proc_buffer.append(entry)
-                if seq > max_seq_seen:
-                    max_seq_seen = seq
-
-        # connection buffer
-        current_conn_buffer = current_state["connection_buffer"]
-
-        different_items = {
-            "connection_buffer": current_conn_buffer,
-            "processing_buffer": new_proc_buffer,
-            "conveyor_params": conveyor_params_diff,
-        }
-
-        prev_state_max_size = (
-            None
-            if self.transmitted_state == {}
-            else self.transmitted_state.get("state_max_size")
-        )
-        if prev_state_max_size != current_state["state_max_size"]:
-            different_items["state_max_size"] = current_state["state_max_size"]
-
-        with self.lock:
-            self.transmitted_state = current_state
-            self.last_transmitted_processing_seq_no = max_seq_seen
-
-        return different_items
-
-    def process_delta(self, different_items):
-        logger.debug("Started proccess_delta.")
-        with self.lock:
-            logger.debug("Lock acquired.")
-            new_conveyor_params = different_items["conveyor_params"]
-            for key, value in new_conveyor_params.items():
-                current_value = getattr(self.conveyor_params, key)
-                if current_value != value:
-                    setattr(self.conveyor_params, key, value)
-
-            new_conn_buffer = different_items["connection_buffer"]
-            self.connection_buffer.extend(new_conn_buffer)
-
-            new_proc_buffer = different_items["processing_buffer"]
-            self.processing_buffer.extend(new_proc_buffer)
-
-    def periodic_dump(self):
-        if not self.do_periodic_dumps:
-            return
-        
-        while self.running:
-            with open(self.periodic_dumps_file_path, "w") as file:
-                file.writelines(json.dumps(self.serialize_state()))
-            time.sleep(self.periodic_dumps_interval)
-
     def _burn_cpu_primes(self, max_n: int):
         for i in range(3, max_n + 1):
             is_prime = True
@@ -560,7 +461,7 @@ class Processing:
                 if i % j == 0:
                     is_prime = False
                     break
-
+    
     def burn_worker_loop(self):
         while True:
             work = self.burn_queue.get()
