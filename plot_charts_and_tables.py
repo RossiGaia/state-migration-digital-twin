@@ -197,8 +197,9 @@ def plot_iteration(
         ["timestamp_unix", "value"],
     ].copy()
 
-    # t0: when odte is not first scraped from old dt
-    odte_loss_old_unix = odte_old["timestamp_unix"].max()
+    # t0: when odte from old instance il last over acceptable treshold
+    odte_loss_old_unix_acceptable = odte_old[odte_old["value"] > 0.9]
+    odte_loss_old_unix = odte_loss_old_unix_acceptable["timestamp_unix"].max()
 
     # t1: first time new/odte >= threshold after t0 (fallback a mig_start)
     t_min_for_recover = odte_loss_old_unix

@@ -230,7 +230,7 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
     current_deployment_service_port = resp.items[0].spec.ports[0].node_port
 
     # disconnect dt from mqtt
-    max_disconnect_retry = 5
+    max_disconnect_retry = 10
     cluster_ip = "10.16.11.142"
     disconnect_url = f"http://{cluster_ip}:{current_deployment_service_port}/disconnect"
     resp = requests.post(disconnect_url)
@@ -239,7 +239,7 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
         logger.error("MQTT disconnection failed. Retrying.")
         max_disconnect_retry -= 1
         resp = requests.post(disconnect_url)
-        time.sleep(0.5)
+        time.sleep(1.0)
 
     if max_disconnect_retry == 0 and resp.status_code != 200:
         logger.error("MQTT disconnection not doable. Exiting.")
@@ -273,13 +273,13 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
     resp = requests.post(checkpoint_url, headers=headers, data=json.dumps(data))
     print(resp.text)
 
-    max_checkpoint_retry = 5
+    max_checkpoint_retry = 10
     while (resp.json()["status"] != "ok" or resp.status_code == 500) and max_checkpoint_retry > 0:
         logger.error("cURL did not run correctly. Should retry.")
         max_checkpoint_retry -= 1
         resp = requests.post(checkpoint_url, headers=headers, data=json.dumps(data))
         print(resp.text)
-        time.sleep(0.5)
+        time.sleep(2.0)
         
 
     if (resp.json()["status"] != "ok" or resp.status_code == 500) and max_checkpoint_retry == 0:
@@ -369,7 +369,7 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
     )
     current_deployment_service_port = resp.items[0].spec.ports[0].node_port
 
-    max_reconnection_retry = 5
+    max_reconnection_retry = 10
 
     # restart the mqtt client on the dt
     reconnect_url = f"http://{cluster_ip}:{current_deployment_service_port}/reconnect"
@@ -379,7 +379,7 @@ def migrate_fn(spec, namespace, meta, name, old, new, logger, **_):
         logger.error("MQTT reconnection failed. Retrying.")
         resp = requests.post(reconnect_url)
         max_reconnection_retry -= 1
-        time.sleep(0.5)
+        time.sleep(2.0)
 
 
     if max_reconnection_retry == 0 and resp.status_code != 200:
