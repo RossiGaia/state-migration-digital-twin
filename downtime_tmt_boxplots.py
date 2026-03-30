@@ -106,14 +106,16 @@ def make_single_boxplot(
     title: str,
     output_path: Path,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(20, 6))
-    ax.boxplot(data, tick_labels=labels, showmeans=True, vert=False)
-    ax.set_xscale("symlog")
-    # ax.set_ylabel("Implementation")
-    ax.set_xlabel(ylabel)
+    fig, ax = plt.subplots(figsize=(9, 8))
+    ax.boxplot(data, tick_labels=labels, showmeans=True, vert=True)
+    ax.set_yscale("symlog")
+    ax.set_ylabel(ylabel)
+    ax.set_ylim(-0.1, 200)
+    # ax.set_xlabel("Implementation")
+    ax.tick_params(axis='x', rotation=35)
     ax.grid(axis="y", linestyle="--", alpha=0.4)
     fig.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -140,7 +142,7 @@ def make_combined_boxplot(
     axes[1].grid(axis="y", linestyle="--", alpha=0.4)
 
     fig.tight_layout()
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
 
