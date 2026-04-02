@@ -431,7 +431,7 @@ class Processing:
 
         coll = self.mongo_client[self.mongo_db][self.mongo_collection]
 
-        cursor = coll.find({}).sort("payload.seq_id", 1)
+        cursor = coll.find({}).sort("payload.seq_id", -1).limit(100)
         events = list(cursor)
         # logger.debug(f"Documents retrived:\n{events}")
 
